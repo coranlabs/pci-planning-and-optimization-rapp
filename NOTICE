@@ -1,0 +1,28 @@
+PCI Planning and Optimization rApp
+Copyright 2025-2026 coRAN LABS Private Limited
+
+This product includes software developed at coRAN LABS Private Limited,
+licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Third-party components
+======================
+
+Vendored under src/pci_planning_and_optimization/webui/static/vendor/:
+
+  React 18.3.1, React DOM 18.3.1   MIT     Meta Platforms, Inc. and affiliates
+  Babel standalone 7.29.0          MIT     The Babel authors
+  MapLibre GL JS 5.2.0 and its CSS BSD-3   MapLibre contributors
+
+Fonts vendored under src/pci_planning_and_optimization/webui/static/fonts/,
+latin and latin-ext subsets only:
+
+  Geist, Geist Mono                OFL-1.1  Vercel
+  Inter                            OFL-1.1  Rasmus Andersson
+  IBM Plex Mono                    OFL-1.1  IBM Corp.
+  Instrument Serif                 OFL-1.1  Instrument
+
+The Helm chart bundles the InfluxDB 2 chart (deploy/helm/pci-planning-rapp/
+charts/influxdb2-2.1.2.tgz), Apache-2.0, InfluxData Inc.
+
+Python dependencies are declared in pyproject.toml and resolved at install
+time; their licences travel with the installed distributions.
