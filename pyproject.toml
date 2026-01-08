@@ -132,3 +132,52 @@ ignore = [
 ]
 fixable = ["ALL"]
 
+[tool.ruff.lint.flake8-bugbear]
+# FastAPI puts its dependency markers in argument defaults by design.
+extend-immutable-calls = ["fastapi.Depends", "fastapi.File", "fastapi.Form", "fastapi.Query"]
+
+[tool.ruff.lint.flake8-type-checking]
+# Pydantic and dataclasses evaluate annotations at runtime, so their imports
+# must stay out of the TYPE_CHECKING block.
+runtime-evaluated-base-classes = [
+    "pydantic.BaseModel",
+    "pydantic_settings.BaseSettings",
+]
+runtime-evaluated-decorators = [
+    "pydantic.validate_call",
+    "dataclasses.dataclass",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"src/pci_planning_and_optimization/main.py" = ["S104"]      # 0.0.0.0 bind is intentional
+"src/pci_planning_and_optimization/__main__.py" = ["S104"]  # same, for the serve CLI default
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"
+docstring-code-format = true
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_no_return = true
+warn_unreachable = true
+show_error_codes = true
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = [
+    "confluent_kafka.*",
+    "pybreaker.*",
+    "influxdb_client.*",
+]
+ignore_missing_imports = true
