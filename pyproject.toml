@@ -1,0 +1,134 @@
+# Copyright 2025-2026 coRAN LABS Private Limited
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+[project]
+name = "pci-planning-and-optimization"
+dynamic = ["version"]
+description = "O-RAN Non-RT-RIC PCI Planning and Optimization rApp — conservative graph-coloring PCI optimizer with operator approval workflow."
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+authors = [
+    { name = "coRAN Labs" },
+]
+keywords = [
+    "o-ran",
+    "non-rt-ric",
+    "rapp",
+    "5g",
+    "ran-slicing",
+    "policy",
+    "kafka",
+    "fastapi",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Telecommunications Industry",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Communications",
+    "Topic :: System :: Networking",
+]
+
+dependencies = [
+    "fastapi>=0.115,<0.117",
+    "uvicorn[standard]>=0.32,<0.33",
+    "python-multipart>=0.0.20",
+
+    "pydantic>=2.9,<3",
+
+    "structlog>=24.4",
+
+    "confluent-kafka>=2.6",
+
+    "asyncssh>=2.18",
+
+    "influxdb-client>=1.46",
+
+    "prometheus-client>=0.21",
+
+    "pybreaker>=1.2",
+    "tenacity>=9.0",
+
+    "lxml>=5.3",
+    "pyyaml>=6.0",
+    "openpyxl>=3.1",
+
+    "networkx>=3.1,<4",
+    "click>=8.1,<9",
+    "scipy>=1.10,<2",
+]
+
+[dependency-groups]
+dev = [
+    "mypy>=1.13",
+    "ruff>=0.7",
+    "types-pyyaml>=6.0",
+    "lxml-stubs>=0.5",
+    "types-aiofiles>=24.1",
+]
+
+[project.scripts]
+pci-planning-and-optimization = "pci_planning_and_optimization.__main__:main"
+
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "src/pci_planning_and_optimization/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pci_planning_and_optimization"]
+artifacts = ["src/pci_planning_and_optimization/webui/**"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W",
+    "F",
+    "I",
+    "B",
+    "C4",
+    "UP",
+    "SIM",
+    "TCH",
+    "RUF",
+    "S",
+    "ASYNC",
+    "PT",
+    "ANN",
+    "RET",
+    "ARG",
+    "PTH",
+]
+ignore = [
+    "E501",     # line length is the formatter's job
+    "ANN401",   # Any is deliberate in the few places it appears
+    "S101",     # asserts are fine in tests
+    "S311",     # standard PRNG, not used for anything security-bearing
+    "RUF001",   # prose uses non-ASCII punctuation deliberately
+    "RUF002",
+    "RUF003",
+    "S310",     # URL schemes are allowlisted before opening
+    "ASYNC109", # timeout= is the public API here; asyncio, not trio
+    "ASYNC240", # trio/anyio rule; this codebase is asyncio plus pathlib
+]
+fixable = ["ALL"]
+
