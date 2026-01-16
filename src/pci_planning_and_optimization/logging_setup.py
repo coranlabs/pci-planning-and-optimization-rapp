@@ -232,3 +232,184 @@ def _console_renderer(colours: bool) -> Processor:
     return render
 
 
+def _json_default(value: Any) -> Any:
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, timedelta):
+        return value.total_seconds()
+    if isinstance(value, BaseException):
+        return str(value)
+    return str(value)
+
+
+def _add_timestamp(_logger: Any, _method_name: str, event_dict: EventDict) -> EventDict:
+    event_dict["timestamp"] = (
+        datetime.now(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")
+    )
+    return event_dict
+
+
+def _add_level(_logger: Any, method_name: str, event_dict: EventDict) -> EventDict:
+    name = method_name.upper()
+    if name == "WARNING":
+        name = "WARN"
+    elif name == "CRITICAL":
+        name = "FATAL"
+    event_dict["level"] = name
+    return event_dict
+
+
+def _attach_trace_context(
+    _logger: Any, _method_name: str, event_dict: EventDict
+) -> EventDict:
+    if "trace_id" not in event_dict:
+        value = trace_id_var.get()
+        if value:
+            event_dict["trace_id"] = value
+    if "span_id" not in event_dict:
+        value = span_id_var.get()
+        if value:
+            event_dict["span_id"] = value
+    return event_dict
+
+
+class Logger:
+
+    __slots__ = ("_bound", "_component", "_config", "_fields")
+
+    def __init__(
+        self,
+        config: Config,
+        bound: structlog.stdlib.BoundLogger | None = None,
+        component: str = "",
+        fields: dict[str, Any] | None = None,
+    ) -> None:
+        self._config = config
+        self._component = component if component else config.component
+        self._fields: dict[str, Any] = dict(fields) if fields else {}
+        self._bound = bound if bound is not None else structlog.get_logger()
+
+    def with_component(self, component: str) -> Self:
+        return type(self)(self._config, self._bound, component, dict(self._fields))
+
+    def with_field(self, key: str, value: Any) -> Self:
+        new_fields = {**self._fields, key: value}
+        return type(self)(self._config, self._bound, self._component, new_fields)
+
+    def with_fields(self, fields: dict[str, Any]) -> Self:
+        new_fields = {**self._fields, **fields}
+        return type(self)(self._config, self._bound, self._component, new_fields)
+
+    def with_error(self, err: BaseException | None) -> Self:
+        if err is None:
+            return self
+        new_fields = {**self._fields, "error": str(err)}
+        if err.__traceback__ is not None:
+            new_fields["stack_trace"] = "".join(
+                tb_mod.format_exception(type(err), err, err.__traceback__)
+            )
+        return type(self)(self._config, self._bound, self._component, new_fields)
+
+    def with_duration(self, duration: timedelta | float) -> Self:
+        if isinstance(duration, timedelta):
+            ms = duration.total_seconds() * 1000.0
+        else:
+            ms = float(duration) * 1000.0
+        return self.with_field("duration_ms", ms)
+
+    def with_context(self, *, trace_id: str | None = None, span_id: str | None = None) -> Self:
+        new_fields = dict(self._fields)
+        if trace_id is not None:
+            new_fields["trace_id"] = trace_id
+        if span_id is not None:
+            new_fields["span_id"] = span_id
+        return type(self)(self._config, self._bound, self._component, new_fields)
+
+    def _enabled(self, level: LogLevel) -> bool:
+        return level.numeric >= self._config.level.numeric
+
+    def _emit(self, level: LogLevel, msg: str) -> None:
+        if not self._enabled(level):
+            return
+        kwargs: dict[str, Any] = dict(self._fields)
+        if self._component:
+            kwargs["component"] = self._component
+        method = level.name.lower()
+        if method == "warn":
+            method = "warning"
+        elif method == "fatal":
+            method = "critical"
+        getattr(self._bound, method)(msg, **kwargs)
+
+    def debug(self, msg: str) -> None:
+        self._emit(LogLevel.DEBUG, msg)
+
+    def debugf(self, fmt: str, *args: Any) -> None:
+        self._emit(LogLevel.DEBUG, fmt % args if args else fmt)
+
+    def info(self, msg: str) -> None:
+        self._emit(LogLevel.INFO, msg)
+
+    def infof(self, fmt: str, *args: Any) -> None:
+        self._emit(LogLevel.INFO, fmt % args if args else fmt)
+
+    def warn(self, msg: str) -> None:
+        self._emit(LogLevel.WARN, msg)
+
+    def warnf(self, fmt: str, *args: Any) -> None:
+        self._emit(LogLevel.WARN, fmt % args if args else fmt)
+
+    def error(self, msg: str) -> None:
+        self._emit(LogLevel.ERROR, msg)
+
+    def errorf(self, fmt: str, *args: Any) -> None:
+        self._emit(LogLevel.ERROR, fmt % args if args else fmt)
+
+    def fatal(self, msg: str) -> None:
+        self._emit(LogLevel.FATAL, msg)
+        sys.exit(1)
+
+    def fatalf(self, fmt: str, *args: Any) -> None:
+        self._emit(LogLevel.FATAL, fmt % args if args else fmt)
+        sys.exit(1)
+
+
+def configure(config: Config) -> Logger:
+    colours = config.console and _supports_colour(config.output)
+    renderer: Processor
+    if config.console:
+        renderer = _console_renderer(colours)
+    elif config.json_format:
+        renderer = _render_log_entry
+    else:
+        renderer = _render_plain
+
+    processors: list[Processor] = [
+        structlog.contextvars.merge_contextvars,
+        _attach_trace_context,
+        _add_timestamp,
+        _add_level,
+    ]
+    if config.include_caller:
+        processors.append(
+            structlog.processors.CallsiteParameterAdder(
+                parameters=[
+                    structlog.processors.CallsiteParameter.FILENAME,
+                    structlog.processors.CallsiteParameter.LINENO,
+                ]
+            )
+        )
+        processors.append(_caller_compose)
+    processors.append(renderer)
+
+    structlog.configure(
+        processors=processors,
+        wrapper_class=structlog.stdlib.BoundLogger,
+        context_class=dict,
+        logger_factory=structlog.PrintLoggerFactory(file=config.output),
+        cache_logger_on_first_use=True,
+    )
+    _configure_stdlib(config, renderer)
+    return Logger(config)
+
+
