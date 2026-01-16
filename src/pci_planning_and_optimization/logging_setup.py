@@ -413,3 +413,195 @@ def configure(config: Config) -> Logger:
     return Logger(config)
 
 
+def _supports_colour(stream: IO[str]) -> bool:
+    if os.environ.get("NO_COLOR"):
+        return False
+    try:
+        return bool(stream.isatty())
+    except Exception:
+        return False
+
+
+def _configure_stdlib(config: Config, renderer: Processor) -> None:
+    handler = stdlib_logging.StreamHandler(config.output)
+    handler.setFormatter(
+        structlog.stdlib.ProcessorFormatter(
+            processor=renderer,
+            foreign_pre_chain=[
+                _attach_trace_context,
+                _add_timestamp,
+                _add_level,
+                _component_from_record,
+            ],
+        )
+    )
+    stdlib_logging.basicConfig(
+        level=config.level.numeric, handlers=[handler], force=True
+    )
+
+
+def _caller_compose(
+    _logger: Any, _method_name: str, event_dict: EventDict
+) -> EventDict:
+    filename = event_dict.pop("filename", None)
+    lineno = event_dict.pop("lineno", None)
+    if filename and lineno is not None:
+        event_dict["caller"] = f"{filename}:{lineno}"
+    return event_dict
+
+
+_global_logger: Logger = Logger(default_config())
+
+
+def set_global(logger: Logger) -> None:
+    global _global_logger
+    _global_logger = logger
+
+
+def get_global() -> Logger:
+    return _global_logger
+
+
+def debug(msg: str) -> None:
+    _global_logger.debug(msg)
+
+
+def debugf(fmt: str, *args: Any) -> None:
+    _global_logger.debugf(fmt, *args)
+
+
+def info(msg: str) -> None:
+    _global_logger.info(msg)
+
+
+def infof(fmt: str, *args: Any) -> None:
+    _global_logger.infof(fmt, *args)
+
+
+def warn(msg: str) -> None:
+    _global_logger.warn(msg)
+
+
+def warnf(fmt: str, *args: Any) -> None:
+    _global_logger.warnf(fmt, *args)
+
+
+def error(msg: str) -> None:
+    _global_logger.error(msg)
+
+
+def errorf(fmt: str, *args: Any) -> None:
+    _global_logger.errorf(fmt, *args)
+
+
+def fatal(msg: str) -> None:
+    _global_logger.fatal(msg)
+
+
+def fatalf(fmt: str, *args: Any) -> None:
+    _global_logger.fatalf(fmt, *args)
+
+
+def with_component(component: str) -> Logger:
+    return _global_logger.with_component(component)
+
+
+def with_field(key: str, value: Any) -> Logger:
+    return _global_logger.with_field(key, value)
+
+
+def with_fields(fields: dict[str, Any]) -> Logger:
+    return _global_logger.with_fields(fields)
+
+
+def with_error(err: BaseException | None) -> Logger:
+    return _global_logger.with_error(err)
+
+
+class RequestLogger:
+
+    __slots__ = ("_logger",)
+
+    def __init__(self, logger: Logger) -> None:
+        self._logger = logger
+
+    def log_request(
+        self,
+        method: str,
+        path: str,
+        status_code: int,
+        duration: timedelta | float,
+        fields: dict[str, Any] | None = None,
+    ) -> None:
+        entry = (
+            self._logger.with_fields(fields or {})
+            .with_field("method", method)
+            .with_field("path", path)
+            .with_field("status_code", status_code)
+            .with_duration(duration)
+        )
+        if status_code >= 500:
+            entry.error("Request failed")
+        elif status_code >= 400:
+            entry.warn("Request error")
+        else:
+            entry.info("Request completed")
+
+
+LOG_FORMAT_ENV: str = "RAPP_LOG_FORMAT"
+
+
+def setup_logging(level: str = "INFO", stream: IO[str] | None = None) -> Logger:
+    log_level = LogLevel.from_name(level)
+    fmt = os.environ.get(LOG_FORMAT_ENV, "json").strip().lower()
+    logger = configure(
+        Config(
+            level=log_level,
+            output=stream,
+            console=fmt == "console",
+            json_format=fmt != "plain",
+        )
+    )
+    set_global(logger)
+    return logger
+
+
+def with_tech(logger: Logger | stdlib_logging.Logger | None, tech: str) -> Any:
+    if isinstance(logger, stdlib_logging.Logger):
+        return stdlib_logging.LoggerAdapter(logger, {"tech": tech})
+    base = logger if logger is not None else get_global()
+    return base.with_field("tech", tech)
+
+
+__all__ = [
+    "LOG_FORMAT_ENV",
+    "Config",
+    "LogLevel",
+    "Logger",
+    "RequestLogger",
+    "bind_contextvars",
+    "configure",
+    "debug",
+    "debugf",
+    "default_config",
+    "error",
+    "errorf",
+    "fatal",
+    "fatalf",
+    "get_contextvars",
+    "get_global",
+    "info",
+    "infof",
+    "set_global",
+    "setup_logging",
+    "short_component",
+    "span_id_var",
+    "trace_id_var",
+    "warn",
+    "warnf",
+    "with_component",
+    "with_error",
+    "with_field",
+    "with_fields",
+    "with_tech",
+]
