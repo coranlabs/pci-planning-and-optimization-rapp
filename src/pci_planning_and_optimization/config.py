@@ -123,3 +123,29 @@ def _try_load_yaml(path: str, log: Any) -> dict[str, Any]:
     return loaded
 
 
+def _env(key: str, default: str) -> str:
+    value = os.environ.get(key, "")
+    return value if value else default
+
+
+def _env_int(key: str, default: int) -> int:
+    value = os.environ.get(key, "")
+    if not value:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+_TRUTHY_VALUES: Final[frozenset[str]] = frozenset(
+    {"1", "true", "yes", "on"}
+)
+
+
+def _is_truthy(value: str) -> bool:
+    return value.strip().lower() in _TRUTHY_VALUES
+
+
+def _config_error(code: str, message: str) -> AppError:
+    return new(ErrorCategory.CONFIGURATION, code, message)
