@@ -242,3 +242,181 @@ def _shadow_threshold_for_pair(
     return thresholds["macro_macro"]
 
 
+class Network:
+
+    def __init__(
+        self,
+        cells: list[Cell],
+        relations: list[NeighborRelation],
+    ) -> None:
+        self.cells: dict[str, Cell] = {c.id: c for c in cells}
+        self.relations: list[NeighborRelation] = list(relations)
+        self._directed_index: dict[tuple[str, str], NeighborRelation] = {}
+        self._neighbors_index: dict[str, set[str]] = {}
+        self._rebuild_indexes()
+
+
+    def _rebuild_indexes(self) -> None:
+        self._directed_index = {
+            (r.source_cell_id, r.target_cell_id): r for r in self.relations
+        }
+        self._neighbors_index = {cell_id: set() for cell_id in self.cells}
+        for r in self.relations:
+            if r.source_cell_id in self._neighbors_index:
+                self._neighbors_index[r.source_cell_id].add(r.target_cell_id)
+            if r.target_cell_id in self._neighbors_index:
+                self._neighbors_index[r.target_cell_id].add(r.source_cell_id)
+
+
+    def relation(self, source_id: str, target_id: str) -> NeighborRelation | None:
+        return self._directed_index.get((source_id, target_id))
+
+    def neighbors_of(
+        self, cell_id: str, same_tech_only: bool = True
+    ) -> list[Cell]:
+        if cell_id not in self.cells:
+            return []
+        cell = self.cells[cell_id]
+        neighbor_ids = self._neighbors_index.get(cell_id, set())
+        out: list[Cell] = []
+        for nid in neighbor_ids:
+            n = self.cells.get(nid)
+            if n is None:
+                continue
+            if same_tech_only and n.technology != cell.technology:
+                continue
+            out.append(n)
+        return out
+
+    def n_hop_neighborhood(
+        self, cell_id: str, n: int, same_tech_only: bool = True
+    ) -> set[str]:
+        if cell_id not in self.cells or n <= 0:
+            return set()
+        origin_tech = self.cells[cell_id].technology
+        visited: set[str] = {cell_id}
+        frontier: set[str] = {cell_id}
+        for _ in range(n):
+            next_frontier: set[str] = set()
+            for cid in frontier:
+                for nid in self._neighbors_index.get(cid, set()):
+                    if nid in visited:
+                        continue
+                    if same_tech_only and self.cells[nid].technology != origin_tech:
+                        continue
+                    next_frontier.add(nid)
+            visited |= next_frontier
+            frontier = next_frontier
+            if not frontier:
+                break
+        visited.discard(cell_id)
+        return visited
+
+
+    def ho_failure_rate(self, a_id: str, b_id: str) -> float:
+        fwd = self.relation(a_id, b_id)
+        rev = self.relation(b_id, a_id)
+        fails = (fwd.ho_failures if fwd else 0) + (rev.ho_failures if rev else 0)
+        attempts = (fwd.ho_attempts if fwd else 0) + (rev.ho_attempts if rev else 0)
+        return fails / attempts if attempts else 0.0
+
+    def ho_attempts_pair(self, a_id: str, b_id: str) -> int:
+        fwd = self.relation(a_id, b_id)
+        rev = self.relation(b_id, a_id)
+        return (fwd.ho_attempts if fwd else 0) + (rev.ho_attempts if rev else 0)
+
+
+    def is_pci_conflict(self, a_id: str, b_id: str) -> bool:
+        a = self.cells.get(a_id)
+        b = self.cells.get(b_id)
+        if a is None or b is None:
+            return False
+        if a.technology != b.technology:
+            return False
+        if a.pci != b.pci:
+            return False
+        if a.primary_frequency() != b.primary_frequency():
+            return False
+        if a.primary_frequency() is None:
+            return False
+        return True
+
+    def mod_n_violation(self, a_id: str, b_id: str, n: int) -> bool:
+        a = self.cells.get(a_id)
+        b = self.cells.get(b_id)
+        if a is None or b is None:
+            return False
+        if a.technology != b.technology:
+            return False
+        if n <= 0:
+            return False
+        return (a.pci % n) == (b.pci % n)
+
+
+    def split_by_technology(self) -> tuple[Network, Network]:
+        lte_cells = [c for c in self.cells.values() if c.technology == Technology.LTE]
+        nr_cells = [c for c in self.cells.values() if c.technology == Technology.NR]
+        lte_ids = {c.id for c in lte_cells}
+        nr_ids = {c.id for c in nr_cells}
+
+        lte_relations = [
+            r for r in self.relations
+            if r.source_cell_id in lte_ids and r.target_cell_id in lte_ids
+        ]
+        nr_relations = [
+            r for r in self.relations
+            if r.source_cell_id in nr_ids and r.target_cell_id in nr_ids
+        ]
+        return Network(lte_cells, lte_relations), Network(nr_cells, nr_relations)
+
+    def add_shadow_relations(self, distance_thresholds: dict[str, float]) -> int:
+        if not distance_thresholds:
+            return 0
+
+        cells = list(self.cells.values())
+        added = 0
+        existing_pairs: set[frozenset] = {
+            frozenset({r.source_cell_id, r.target_cell_id}) for r in self.relations
+        }
+
+        for i, a in enumerate(cells):
+            if a.lat is None or a.lon is None:
+                continue
+            for b in cells[i + 1:]:
+                if b.lat is None or b.lon is None:
+                    continue
+                if a.technology != b.technology:
+                    continue
+                if a.primary_frequency() != b.primary_frequency():
+                    continue
+                if a.primary_frequency() is None:
+                    continue
+                pair_key = frozenset({a.id, b.id})
+                if pair_key in existing_pairs:
+                    continue
+                threshold = _shadow_threshold_for_pair(
+                    a.cell_type, b.cell_type, distance_thresholds
+                )
+                d = _haversine_m(a.lat, a.lon, b.lat, b.lon)
+                if d > threshold:
+                    continue
+                fwd = NeighborRelation(
+                    source_cell_id=a.id,
+                    target_cell_id=b.id,
+                    relation_source=RelationSource.SHADOW,
+                    is_x2_xn=False,
+                )
+                rev = NeighborRelation(
+                    source_cell_id=b.id,
+                    target_cell_id=a.id,
+                    relation_source=RelationSource.SHADOW,
+                    is_x2_xn=False,
+                )
+                self.relations.append(fwd)
+                self.relations.append(rev)
+                existing_pairs.add(pair_key)
+                added += 2
+
+        if added:
+            self._rebuild_indexes()
+        return added
