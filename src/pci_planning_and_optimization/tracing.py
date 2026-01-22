@@ -186,3 +186,123 @@ class Span:
             )
         _get_tracer()._export_span(self)
 
+    def __enter__(self) -> Span:
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> bool | None:
+        if exc_val is not None:
+            self.record_error(exc_val)
+        self.end()
+        return None
+
+
+class SpanExporter(Protocol):
+    def export(self, span: Span) -> None: ...
+    def shutdown(self) -> None: ...
+
+
+class LogExporter:
+
+    def export(self, span: Span) -> None:
+        return None
+
+    def shutdown(self) -> None:
+        return None
+
+
+class NoopExporter:
+
+    def export(self, span: Span) -> None:
+        return None
+
+    def shutdown(self) -> None:
+        return None
+
+
+@dataclass
+class Config:
+    service_name: str = "pci-planning-and-optimization"
+    version: str = "1.0.0"
+    enabled: bool = True
+    exporter: SpanExporter | None = None
+
+
+def default_config() -> Config:
+    return Config(exporter=LogExporter())
+
+
+class Tracer:
+
+    __slots__ = ("_lock", "enabled", "exporter", "service_name", "version")
+
+    def __init__(
+        self,
+        service_name: str,
+        version: str,
+        enabled: bool,
+        exporter: SpanExporter | None,
+    ) -> None:
+        self.service_name = service_name
+        self.version = version
+        self.enabled = enabled
+        self.exporter: SpanExporter = exporter if exporter is not None else LogExporter()
+        self._lock = threading.RLock()
+
+    def _export_span(self, span: Span) -> None:
+        if not self.enabled or self.exporter is None:
+            return
+        try:
+            self.exporter.export(span)
+        except Exception as exc:
+            _log.warning("[TRACING] Failed to export span: %s", exc)
+
+
+_tracer_lock = threading.Lock()
+_default_tracer: Tracer | None = None
+
+
+def init(cfg: Config) -> None:
+    global _default_tracer
+    with _tracer_lock:
+        if _default_tracer is not None:
+            return
+        _default_tracer = Tracer(
+            service_name=cfg.service_name,
+            version=cfg.version,
+            enabled=cfg.enabled,
+            exporter=cfg.exporter if cfg.exporter is not None else LogExporter(),
+        )
+        _log.info(
+            "[TRACING] Initialized tracer for service: %s (enabled: %s)",
+            cfg.service_name,
+            cfg.enabled,
+        )
+
+
+def _get_tracer() -> Tracer:
+    global _default_tracer
+    if _default_tracer is None:
+        init(default_config())
+    assert _default_tracer is not None
+    return _default_tracer
+
+
+def shutdown() -> None:
+    global _default_tracer
+    if _default_tracer is not None and _default_tracer.exporter is not None:
+        _default_tracer.exporter.shutdown()
+    _default_tracer = None
+
+
+current_span_var: ContextVar[Span | None] = ContextVar("current_span", default=None)
+
+
+def span_from_context() -> Span | None:
+    return current_span_var.get()
+
+
+def trace_id_from_context() -> str:
+    span = current_span_var.get()
+    return span.trace_id if span is not None else ""
+
+
