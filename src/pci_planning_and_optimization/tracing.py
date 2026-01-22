@@ -306,3 +306,183 @@ def trace_id_from_context() -> str:
     return span.trace_id if span is not None else ""
 
 
+def span_id_from_context() -> str:
+    span = current_span_var.get()
+    return span.span_id if span is not None else ""
+
+
+def correlation_id() -> str:
+    cid = trace_id_from_context()
+    return cid if cid else _generate_trace_id()
+
+
+def with_correlation_id() -> Span:
+    existing = current_span_var.get()
+    if existing is not None and existing.trace_id:
+        return existing
+    span = Span(
+        trace_id=_generate_trace_id(),
+        span_id=_generate_span_id(),
+    )
+    span._ctx_token = current_span_var.set(span)
+    return span
+
+
+SpanOption = Any
+
+
+def with_span_kind(kind: SpanKind) -> SpanOption:
+    def apply(s: Span) -> None:
+        s.kind = kind
+
+    return apply
+
+
+def with_attributes(*attrs: Attribute) -> SpanOption:
+    def apply(s: Span) -> None:
+        for a in attrs:
+            s.attributes[a.key] = a.value
+
+    return apply
+
+
+def start_span(name: str, *options: SpanOption) -> Span:
+    tracer = _get_tracer()
+    parent = current_span_var.get()
+
+    span = Span(
+        span_id=_generate_span_id(),
+        name=name,
+        kind=SpanKind.INTERNAL,
+    )
+    if parent is not None:
+        span.trace_id = parent.trace_id
+        span.parent_id = parent.span_id
+    else:
+        span.trace_id = _generate_trace_id()
+
+    for opt in options:
+        if opt is not None:
+            opt(span)
+
+    span.attributes["service.name"] = tracer.service_name
+    span.attributes["service.version"] = tracer.version
+
+    span._ctx_token = current_span_var.set(span)
+    return span
+
+
+def _generate_trace_id() -> str:
+    return str(uuid.uuid4())
+
+
+def _generate_span_id() -> str:
+    return str(uuid.uuid4())[:16]
+
+
+def _truncate_id(span_or_trace_id: str) -> str:
+    if not span_or_trace_id:
+        return "root"
+    return span_or_trace_id[:8] if len(span_or_trace_id) > 8 else span_or_trace_id
+
+
+def trace_kafka_consume(topic: str, partition: int, offset: int) -> Span:
+    return start_span(
+        "kafka.consume",
+        with_span_kind(SpanKind.CONSUMER),
+        with_attributes(
+            string_attr("messaging.system", "kafka"),
+            string_attr("messaging.destination", topic),
+            int_attr("messaging.kafka.partition", partition),
+            int_attr("messaging.kafka.offset", offset),
+        ),
+    )
+
+
+def trace_sftp_download(host: str, path: str, expected_size: int) -> Span:
+    return start_span(
+        "sftp.download",
+        with_span_kind(SpanKind.CLIENT),
+        with_attributes(
+            string_attr("sftp.host", host),
+            string_attr("sftp.path", path),
+            int_attr("sftp.expected_size", expected_size),
+        ),
+    )
+
+
+def trace_xml_parse(filename: str) -> Span:
+    return start_span(
+        "xml.parse",
+        with_attributes(string_attr("file.name", filename)),
+    )
+
+
+def trace_influxdb_write(measurement: str, point_count: int) -> Span:
+    return start_span(
+        "influxdb.write",
+        with_span_kind(SpanKind.CLIENT),
+        with_attributes(
+            string_attr("db.system", "influxdb"),
+            string_attr("db.operation", "write"),
+            string_attr("influxdb.measurement", measurement),
+            int_attr("influxdb.point_count", point_count),
+        ),
+    )
+
+
+def trace_alert_evaluation(gnb_id: str, rule_count: int) -> Span:
+    return start_span(
+        "alert.evaluate",
+        with_attributes(
+            string_attr("gnb_id", gnb_id),
+            int_attr("rule_count", rule_count),
+        ),
+    )
+
+
+def log_with_trace(fmt: str, *args: Any) -> None:
+    trace_id = trace_id_from_context()
+    span_id = span_id_from_context()
+    prefix = ""
+    if trace_id:
+        prefix = f"[trace={trace_id[:8]} span={span_id[:8]}] "
+    _log.info(prefix + fmt, *args)
+
+
+__all__ = [
+    "Attribute",
+    "Config",
+    "LogExporter",
+    "NoopExporter",
+    "Span",
+    "SpanEvent",
+    "SpanExporter",
+    "SpanKind",
+    "Status",
+    "Tracer",
+    "bool_attr",
+    "correlation_id",
+    "current_span_var",
+    "default_config",
+    "duration_attr",
+    "float_attr",
+    "init",
+    "int_attr",
+    "log_with_trace",
+    "shutdown",
+    "span_from_context",
+    "span_id_from_context",
+    "start_span",
+    "string_attr",
+    "time",
+    "trace_alert_evaluation",
+    "trace_id_from_context",
+    "trace_influxdb_write",
+    "trace_kafka_consume",
+    "trace_sftp_download",
+    "trace_xml_parse",
+    "with_attributes",
+    "with_correlation_id",
+    "with_span_kind",
+]
