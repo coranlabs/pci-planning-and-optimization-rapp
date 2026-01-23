@@ -176,3 +176,144 @@ class Manager:
         self._cache_ttl: float = cfg.cache_ttl
         self._check_timeout: float = cfg.check_timeout
 
+    async def register_checker(self, name: str, checker: Checker) -> None:
+        async with self._mu:
+            self._checkers[name] = checker
+        self._logger.infof("[HEALTH] Registered health checker for component: %s", name)
+
+    def register_checker_sync(self, name: str, checker: Checker) -> None:
+        self._checkers[name] = checker
+        self._logger.infof("[HEALTH] Registered health checker for component: %s", name)
+
+    async def unregister_checker(self, name: str) -> bool:
+        async with self._mu:
+            return self._checkers.pop(name, None) is not None
+
+    def set_startup_ready(self) -> None:
+        self._startup_ready = True
+        self._logger.info("[HEALTH] Application marked as startup ready")
+
+    def set_shutdown_mode(self) -> None:
+        self._shutdown_mode = True
+        self._logger.info("[HEALTH] Application entering shutdown mode")
+
+    def is_startup_ready(self) -> bool:
+        return self._startup_ready
+
+    def is_shutting_down(self) -> bool:
+        return self._shutdown_mode
+
+    async def _run_checker(self, name: str, checker: Checker) -> ComponentHealth:
+        try:
+            if inspect.iscoroutinefunction(checker):
+                coro: Awaitable[ComponentHealth] = checker()
+            else:
+                coro = asyncio.to_thread(checker)
+            health = await asyncio.wait_for(coro, timeout=self._check_timeout)
+        except TimeoutError:
+            self._logger.warnf(
+                "[HEALTH] Checker %s timed out after %ss", name, self._check_timeout
+            )
+            health = ComponentHealth(
+                status=Status.UNHEALTHY,
+                message=f"health check timed out after {self._check_timeout}s",
+            )
+        except Exception as exc:
+            self._logger.with_error(exc).errorf(
+                "[HEALTH] Checker %s raised an exception", name
+            )
+            health = ComponentHealth(
+                status=Status.UNHEALTHY,
+                message=f"health check raised: {exc}",
+            )
+        health.name = name
+        health.last_checked = _now_utc()
+        return health
+
+    async def check_health(self) -> HealthResponse:
+        async with self._check_mu:
+            now_mono = time.monotonic()
+            if (now_mono - self._last_check_mono) < self._cache_ttl and self._cache:
+                return self._build_response(self._cache)
+
+            async with self._mu:
+                checkers_snapshot = dict(self._checkers)
+
+            if not checkers_snapshot:
+                self._cache = {}
+                self._last_check_mono = time.monotonic()
+                return self._build_response({})
+
+            tasks = [
+                asyncio.create_task(self._run_checker(name, c), name=f"hc:{name}")
+                for name, c in checkers_snapshot.items()
+            ]
+            done = await asyncio.gather(*tasks, return_exceptions=False)
+            results: dict[str, ComponentHealth] = {
+                ch.name: ch for ch in done
+            }
+
+            self._cache = results
+            self._last_check_mono = time.monotonic()
+
+            return self._build_response(results)
+
+    def _build_response(
+        self, components: Mapping[str, ComponentHealth]
+    ) -> HealthResponse:
+        overall = Status.HEALTHY
+        has_unhealthy = False
+        has_degraded = False
+        for c in components.values():
+            if c.status == Status.UNHEALTHY:
+                has_unhealthy = True
+            elif c.status == Status.DEGRADED:
+                has_degraded = True
+        if has_unhealthy:
+            overall = Status.UNHEALTHY
+        elif has_degraded:
+            overall = Status.DEGRADED
+
+        return HealthResponse(
+            status=overall,
+            timestamp=_now_utc(),
+            components=dict(components),
+            version=self._version,
+            uptime=_format_uptime(self._start_mono),
+        )
+
+    def liveness_payload(self) -> tuple[dict[str, str], int]:
+        return {"status": "alive"}, 200
+
+    def readiness_payload(self) -> tuple[dict[str, str], int]:
+        if self.is_shutting_down():
+            return {"status": "shutting_down"}, 503
+        if not self.is_startup_ready():
+            return {"status": "not_ready"}, 503
+        return {"status": "ready"}, 200
+
+    def startup_payload(self) -> tuple[dict[str, str], int]:
+        if not self.is_startup_ready():
+            return {"status": "starting"}, 503
+        return {"status": "started"}, 200
+
+    def handle_liveness_probe(self) -> Response:
+        payload, code = self.liveness_payload()
+        return _json_response(payload, code)
+
+    def handle_readiness_probe(self) -> Response:
+        payload, code = self.readiness_payload()
+        return _json_response(payload, code)
+
+    def handle_startup_probe(self) -> Response:
+        payload, code = self.startup_payload()
+        return _json_response(payload, code)
+
+    def liveness_handler_response(self) -> Response:
+        payload = {
+            "status": "alive",
+            "timestamp": _format_rfc3339_nano(_now_utc()),
+            "uptime": _format_uptime(self._start_mono),
+        }
+        return _json_response(payload, 200)
+
