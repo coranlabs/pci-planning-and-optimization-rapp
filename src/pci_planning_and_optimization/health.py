@@ -317,3 +317,238 @@ class Manager:
         }
         return _json_response(payload, 200)
 
+    async def readiness_handler_response(self) -> Response:
+        if not self.is_startup_ready():
+            return _json_response(
+                {
+                    "status": "not_ready",
+                    "reason": "startup_incomplete",
+                    "message": "Application is still starting up",
+                },
+                503,
+            )
+        if self.is_shutting_down():
+            return _json_response(
+                {
+                    "status": "not_ready",
+                    "reason": "shutting_down",
+                    "message": "Application is shutting down",
+                },
+                503,
+            )
+        resp = await self.check_health()
+        code = 503 if resp.status == Status.UNHEALTHY else 200
+        payload: dict[str, Any] = {
+            "status": str(resp.status),
+            "timestamp": _format_rfc3339_nano(resp.timestamp),
+            "components": {n: c.to_dict() for n, c in resp.components.items()},
+        }
+        return _json_response(payload, code)
+
+    def startup_handler_response(self) -> Response:
+        if self.is_startup_ready():
+            payload = {
+                "status": "started",
+                "timestamp": _format_rfc3339_nano(_now_utc()),
+                "uptime": _format_uptime(self._start_mono),
+            }
+            return _json_response(payload, 200)
+        return _json_response(
+            {"status": "starting", "message": "Application is initializing"},
+            503,
+        )
+
+    async def full_health_handler_response(self) -> Response:
+        resp = await self.check_health()
+        if resp.status == Status.HEALTHY or resp.status == Status.DEGRADED:
+            code = 200
+        elif resp.status == Status.UNHEALTHY:
+            code = 503
+        else:
+            code = 500
+        return _json_response(resp.to_dict(), code)
+
+
+def kafka_checker(
+    is_connected: Callable[[], bool],
+    in_flight_count: Callable[[], int],
+) -> AsyncChecker:
+
+    async def _checker() -> ComponentHealth:
+        connected = bool(is_connected())
+        in_flight = int(in_flight_count())
+        status = Status.HEALTHY
+        message = "Kafka consumer is connected"
+        if not connected:
+            status = Status.UNHEALTHY
+            message = "Kafka consumer is disconnected"
+        return ComponentHealth(
+            status=status,
+            message=message,
+            details={
+                "connected": connected,
+                "in_flight_count": in_flight,
+            },
+        )
+
+    return _checker
+
+
+def influxdb_checker(
+    ping: Callable[[], Awaitable[None]] | Callable[[], None],
+) -> AsyncChecker:
+
+    async def _checker() -> ComponentHealth:
+        try:
+            result = ping()
+            if inspect.isawaitable(result):
+                await result
+        except Exception as exc:
+            return ComponentHealth(
+                status=Status.UNHEALTHY,
+                message=f"InfluxDB ping failed: {exc}",
+            )
+        return ComponentHealth(
+            status=Status.HEALTHY,
+            message="InfluxDB is reachable",
+        )
+
+    return _checker
+
+
+def sftp_checker(
+    get_pool_stats: Callable[[], Mapping[str, Any]],
+) -> AsyncChecker:
+
+    async def _checker() -> ComponentHealth:
+        stats = dict(get_pool_stats() or {})
+        active_raw = stats.get("active_connections", 0)
+        total_raw = stats.get("total_connections", 0)
+        active = int(active_raw) if isinstance(active_raw, (int, float)) else 0
+        total = int(total_raw) if isinstance(total_raw, (int, float)) else 0
+
+        status = Status.HEALTHY
+        message = "SFTP pool is healthy"
+        if total > 0 and (active / total) > 0.9:
+            status = Status.DEGRADED
+            message = "SFTP pool is heavily utilized"
+
+        return ComponentHealth(status=status, message=message, details=stats)
+
+    return _checker
+
+
+def dlq_checker(
+    get_stats: Callable[[], Mapping[str, Any]],
+) -> AsyncChecker:
+
+    async def _checker() -> ComponentHealth:
+        stats = dict(get_stats() or {})
+
+        enabled_raw = stats.get("enabled", False)
+        enabled = bool(enabled_raw) if isinstance(enabled_raw, bool) else False
+        if not enabled:
+            return ComponentHealth(status=Status.HEALTHY, message="DLQ is disabled")
+
+        total_raw = stats.get("total_messages", 0)
+        perm_raw = stats.get("permanent_failure", 0)
+        max_raw = stats.get("max_size", 10000)
+
+        total = int(total_raw) if isinstance(total_raw, (int, float)) else 0
+        permanent = int(perm_raw) if isinstance(perm_raw, (int, float)) else 0
+        max_size = int(max_raw) if isinstance(max_raw, (int, float)) else 10000
+
+        status = Status.HEALTHY
+        message = "DLQ is operating normally"
+        if permanent > 100:
+            status = Status.DEGRADED
+            message = "DLQ has many permanent failures, manual intervention may be needed"
+        if max_size > 0 and (total / max_size) > 0.8:
+            status = Status.DEGRADED
+            message = "DLQ is filling up"
+
+        return ComponentHealth(status=status, message=message, details=stats)
+
+    return _checker
+
+
+def circuit_breaker_checker(
+    get_stats: Callable[[], Mapping[str, Any]],
+) -> AsyncChecker:
+
+    async def _checker() -> ComponentHealth:
+        stats = dict(get_stats() or {})
+        open_circuits = 0
+        for v in stats.values():
+            if isinstance(v, Mapping):
+                state = v.get("state")
+                if isinstance(state, str) and state == "open":
+                    open_circuits += 1
+        status = Status.HEALTHY
+        message = "All circuit breakers are closed"
+        if open_circuits > 0:
+            status = Status.DEGRADED
+            message = "Some circuit breakers are open"
+        return ComponentHealth(
+            status=status,
+            message=message,
+            details={
+                "open_circuits": open_circuits,
+                "circuits": stats,
+            },
+        )
+
+    return _checker
+
+
+KafkaChecker = kafka_checker
+InfluxDBChecker = influxdb_checker
+SFTPChecker = sftp_checker
+DLQChecker = dlq_checker
+CircuitBreakerChecker = circuit_breaker_checker
+
+
+def health_router(manager: Manager) -> APIRouter:
+    router = APIRouter(tags=["health"])
+
+    @router.get("/healthz", include_in_schema=True)
+    async def healthz(_request: Request) -> Response:
+        return manager.handle_liveness_probe()
+
+    @router.get("/readyz", include_in_schema=True)
+    async def readyz(_request: Request) -> Response:
+        return manager.handle_readiness_probe()
+
+    @router.get("/startupz", include_in_schema=True)
+    async def startupz(_request: Request) -> Response:
+        return manager.handle_startup_probe()
+
+    return router
+
+
+__all__ = [
+    "STATUS_DEGRADED",
+    "STATUS_HEALTHY",
+    "STATUS_UNHEALTHY",
+    "STATUS_UNKNOWN",
+    "AsyncChecker",
+    "Checker",
+    "CircuitBreakerChecker",
+    "ComponentHealth",
+    "Config",
+    "DLQChecker",
+    "HealthResponse",
+    "InfluxDBChecker",
+    "KafkaChecker",
+    "Manager",
+    "SFTPChecker",
+    "Status",
+    "SyncChecker",
+    "circuit_breaker_checker",
+    "default_config",
+    "dlq_checker",
+    "health_router",
+    "influxdb_checker",
+    "kafka_checker",
+    "sftp_checker",
+]
