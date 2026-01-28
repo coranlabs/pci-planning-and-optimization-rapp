@@ -132,3 +132,135 @@ class RecoveryMiddleware(BaseHTTPMiddleware):
             return _panic_response()
 
 
+def recovery_func(fn: Callable[[], Any]) -> BaseException | None:
+    try:
+        fn()
+    except Exception as exc:
+        _log_panic(
+            exc=exc,
+            location="function",
+            include_stack=True,
+        )
+        return exc
+    return None
+
+
+_BACKGROUND_TASKS: set[asyncio.Task[Any]] = set()
+
+
+async def _safe_run(
+    coro: Awaitable[Any],
+    *,
+    location: str,
+    on_panic: PanicCallback | None = None,
+) -> None:
+    try:
+        await coro
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        stack = _log_panic(exc=exc, location=location, include_stack=True)
+        if on_panic is not None:
+            try:
+                on_panic(exc, stack)
+            except Exception as cb_exc:
+                _component_logger().with_error(cb_exc).error(
+                    "[RECOVERY] on_panic callback raised; suppressing"
+                )
+
+
+def safe_go(coro: Awaitable[Any]) -> asyncio.Task[None]:
+    task: asyncio.Task[None] = asyncio.create_task(
+        _safe_run(coro, location="goroutine")
+    )
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_TASKS.discard)
+    return task
+
+
+def safe_go_with_callback(
+    coro: Awaitable[Any],
+    on_panic: PanicCallback | None,
+) -> asyncio.Task[None]:
+    task: asyncio.Task[None] = asyncio.create_task(
+        _safe_run(coro, location="goroutine", on_panic=on_panic)
+    )
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_TASKS.discard)
+    return task
+
+
+def safe_go_with_restart(
+    name: str,
+    coro_factory: Callable[[], Awaitable[Any]],
+    max_restarts: int,
+) -> asyncio.Task[None]:
+
+    async def supervisor() -> None:
+        restarts = 0
+        while True:
+            try:
+                await coro_factory()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                restarts += 1
+                _log_panic(
+                    exc=exc,
+                    location=f"goroutine '{name}'",
+                    include_stack=True,
+                    extra_fields={
+                        "name": name,
+                        "restart": restarts,
+                        "max_restarts": max_restarts,
+                    },
+                )
+                if max_restarts > 0 and restarts >= max_restarts:
+                    _component_logger().with_fields(
+                        {"name": name, "max_restarts": max_restarts}
+                    ).error(
+                        f"[RECOVERY] Goroutine '{name}' reached max restarts "
+                        f"({max_restarts}), stopping"
+                    )
+                    return
+                continue
+            return
+
+    task: asyncio.Task[None] = asyncio.create_task(supervisor())
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_TASKS.discard)
+    return task
+
+
+def must(value: T, err: BaseException | None) -> T:
+    if err is not None:
+        raise RuntimeError(f"must: {err}") from err
+    return value
+
+
+def must_not_panic(fn: Callable[[], Any]) -> BaseException | None:
+    try:
+        result = fn()
+    except Exception as exc:
+        _log_panic(exc=exc, location="callable (converted to error)", include_stack=True)
+        return exc
+    if isinstance(result, BaseException):
+        return result
+    return None
+
+
+_ = get_global
+
+
+__all__ = [
+    "PanicCallback",
+    "RecoveryConfig",
+    "RecoveryMiddleware",
+    "default_recovery_config",
+    "must",
+    "must_not_panic",
+    "recovery_func",
+    "safe_go",
+    "safe_go_with_callback",
+    "safe_go_with_restart",
+]
