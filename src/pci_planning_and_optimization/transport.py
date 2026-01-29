@@ -121,3 +121,64 @@ class UrlLibTransport:
             status=resp_status, headers=resp_headers, body=resp_body
         )
 
+    @staticmethod
+    def _normalise_headers(items) -> dict[str, str]:
+        out: dict[str, str] = {}
+        for k, v in items:
+            out[k.lower()] = v
+        return out
+
+
+@dataclass
+class ResilientTransport:
+
+    inner: HttpTransport
+    breaker_name: str = "http"
+    _breaker: Any = field(default=None, init=False, repr=False)
+    _retry_cfg: Any = field(default=None, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        from pci_planning_and_optimization.resilience import circuitbreaker as _cb
+        from pci_planning_and_optimization.resilience import retry as _retry
+
+        self._retry_cfg = _retry.http_config()
+        self._breaker = _cb.new_breaker(_cb.default_config(self.breaker_name))
+
+    def request(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: Mapping[str, str] | None = None,
+        body: bytes | None = None,
+        timeout: float | None = None,
+    ) -> HttpResponse:
+        from pci_planning_and_optimization.resilience import circuitbreaker as _cb
+        from pci_planning_and_optimization.resilience import retry as _retry
+
+        holder: dict[str, HttpResponse] = {}
+
+        def attempt(_n: int) -> None:
+            resp = self.inner.request(
+                method, url, headers=headers, body=body, timeout=timeout,
+            )
+            holder["resp"] = resp
+            if _retry.is_http_status_retryable(resp.status):
+                raise HttpTransportError(
+                    f"transport error for {method} {url}: HTTP {resp.status}"
+                )
+
+        def run() -> HttpResponse:
+            result = _retry.do_sync_with_retry_check(
+                self._retry_cfg, attempt, _retry.http_is_retryable,
+            )
+            if result.last_err is not None:
+                raise result.last_err
+            return holder["resp"]
+
+        try:
+            return self._breaker.execute(run)
+        except _cb.CircuitOpenError as e:
+            raise HttpTransportError(
+                f"transport error for {method} {url}: circuit open ({e})"
+            ) from e
