@@ -190,3 +190,136 @@ def _log_created(key: str, config: RateLimiterConfig) -> None:
     )
 
 
+def _log_cleanup(removed: int) -> None:
+    _component_logger().infof(
+        "[RATELIMIT] Cleanup: removed %d idle limiters", removed
+    )
+
+
+def _log_rate_limited(key: str) -> None:
+    _component_logger().warnf(
+        "[RATELIMIT] Wait timeout exceeded for %s; raising ERR_RATE_LIMITED",
+        key,
+    )
+
+
+class RateLimiterManager:
+
+    __slots__ = ("_config", "_limiters", "_lock")
+
+    def __init__(self, default_config: RateLimiterConfig | None = None) -> None:
+        self._config = default_config if default_config is not None else RateLimiterConfig()
+        self._limiters: dict[str, RateLimiter] = {}
+        self._lock = threading.RLock()
+
+    @property
+    def config(self) -> RateLimiterConfig:
+        return self._config
+
+    def get_or_create(self, key: str) -> RateLimiter:
+        with self._lock:
+            existing = self._limiters.get(key)
+            if existing is not None:
+                return existing
+            limiter = RateLimiter(key, self._config)
+            self._limiters[key] = limiter
+            _log_created(key, self._config)
+            return limiter
+
+    def allow(self, key: str) -> bool:
+        return self.get_or_create(key).try_acquire()
+
+    async def wait(self, key: str, timeout: float | None = None) -> None:
+        await self.get_or_create(key).acquire(timeout=timeout)
+
+    def stats(self) -> dict[str, Any]:
+        with self._lock:
+            return {key: limiter.stats() for key, limiter in self._limiters.items()}
+
+    def cleanup(self, max_idle: float) -> int:
+        cutoff = _now() - max_idle
+        removed = 0
+        with self._lock:
+            for key in list(self._limiters.keys()):
+                limiter = self._limiters[key]
+                if limiter.last_update < cutoff:
+                    del self._limiters[key]
+                    removed += 1
+        if removed > 0:
+            _log_cleanup(removed)
+        return removed
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._limiters)
+
+    def __contains__(self, key: object) -> bool:
+        with self._lock:
+            return key in self._limiters
+
+
+_global_manager: RateLimiterManager | None = None
+_global_lock = threading.Lock()
+
+
+def global_manager() -> RateLimiterManager:
+    global _global_manager
+    if _global_manager is None:
+        with _global_lock:
+            if _global_manager is None:
+                _global_manager = RateLimiterManager(default_config())
+    return _global_manager
+
+
+def reset_global_manager() -> None:
+    global _global_manager
+    with _global_lock:
+        _global_manager = None
+
+
+KeyFunc = Callable[[Any], str]
+
+
+def _default_key(request: Any) -> str:
+    client = getattr(request, "client", None)
+    if client is not None:
+        host = getattr(client, "host", None)
+        if host:
+            return str(host)
+    return "anonymous"
+
+
+def rate_limit_dependency(
+    manager: RateLimiterManager | None = None,
+    *,
+    key_func: KeyFunc | None = None,
+    block: bool = False,
+    timeout: float | None = None,
+) -> Callable[[Any], Awaitable[None]]:
+    chosen_key = key_func if key_func is not None else _default_key
+
+    async def _dependency(request: Any) -> None:
+        active = manager if manager is not None else global_manager()
+        key = chosen_key(request)
+        if block:
+            await active.wait(key, timeout=timeout)
+            return
+        if not active.allow(key):
+            _log_rate_limited(key)
+            raise ERR_RATE_LIMITED.with_context("limiter", key)
+
+    return _dependency
+
+
+__all__ = [
+    "KeyFunc",
+    "RateLimiter",
+    "RateLimiterConfig",
+    "RateLimiterManager",
+    "default_config",
+    "global_manager",
+    "rate_limit_dependency",
+    "reset_global_manager",
+    "set_clock",
+    "set_sleeper",
+]
