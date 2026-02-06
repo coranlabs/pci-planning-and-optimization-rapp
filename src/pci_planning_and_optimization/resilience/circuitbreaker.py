@@ -149,3 +149,124 @@ class Config(BaseModel):
     )
 
 
+def default_config(name: str) -> Config:
+    return Config(
+        name=name,
+        max_requests=3,
+        interval=60.0,
+        timeout=30.0,
+        failure_ratio=0.6,
+        min_requests=5,
+        on_state_change=None,
+    )
+
+
+_log: Logger = with_component("circuit-breaker")
+
+
+class Breaker:
+
+    __slots__ = (
+        "_async_lock",
+        "_config",
+        "_counts",
+        "_expiry",
+        "_generation",
+        "_state",
+        "_sync_lock",
+    )
+
+    def __init__(self, config: Config) -> None:
+        self._config = config
+        self._state: State = State.CLOSED
+        self._counts: Counts = Counts()
+        self._expiry: float = self._compute_initial_expiry()
+        self._generation: int = 0
+        self._sync_lock = threading.RLock()
+        self._async_lock = asyncio.Lock()
+
+    @property
+    def name(self) -> str:
+        return self._config.name
+
+    @property
+    def config(self) -> Config:
+        return self._config
+
+    def state(self) -> State:
+        with self._sync_lock:
+            now = _monotonic()
+            state, _ = self._current_state(now)
+            return state
+
+    def counts(self) -> Counts:
+        with self._sync_lock:
+            return self._counts.model_copy()
+
+    def is_open(self) -> bool:
+        return self.state() == State.OPEN
+
+    def is_closed(self) -> bool:
+        return self.state() == State.CLOSED
+
+    def is_half_open(self) -> bool:
+        return self.state() == State.HALF_OPEN
+
+    def execute(self, fn: Callable[..., T], *args: Any, **kwargs: Any) -> T:
+        generation = self._before_call()
+        try:
+            result = fn(*args, **kwargs)
+        except BaseException as exc:
+            self._after_call(generation, success=False)
+            raise exc
+        self._after_call(generation, success=True)
+        return result
+
+    async def execute_async(
+        self,
+        fn: Callable[..., Awaitable[T]],
+        *args: Any,
+        **kwargs: Any,
+    ) -> T:
+        async with self._async_lock:
+            generation = self._before_call()
+        try:
+            result = await fn(*args, **kwargs)
+        except BaseException as exc:
+            async with self._async_lock:
+                self._after_call(generation, success=False)
+            raise exc
+        async with self._async_lock:
+            self._after_call(generation, success=True)
+        return result
+
+    def _before_call(self) -> int:
+        with self._sync_lock:
+            now = _monotonic()
+            state, generation = self._current_state(now)
+            if state == State.OPEN:
+                err = ErrCircuitOpen.with_cause(
+                    RuntimeError(f"breaker {self._config.name!r} is open")
+                )
+                raise CircuitOpenError(err)
+            if state == State.HALF_OPEN and self._counts.requests >= self._config.max_requests:
+                err = ErrTooManyRequests.with_cause(
+                    RuntimeError(
+                        f"breaker {self._config.name!r} is half-open and at probe limit"
+                    )
+                )
+                raise CircuitOpenError(err)
+            self._counts.on_request()
+            return generation
+
+    def _after_call(self, before_generation: int, *, success: bool) -> None:
+        with self._sync_lock:
+            now = _monotonic()
+            state, generation = self._current_state(now)
+            if generation != before_generation:
+                return
+            if success:
+                self._on_success(state, now)
+            else:
+                self._on_failure(state, now)
+
