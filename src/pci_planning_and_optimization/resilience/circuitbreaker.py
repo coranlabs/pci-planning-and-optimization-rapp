@@ -270,3 +270,201 @@ class Breaker:
             else:
                 self._on_failure(state, now)
 
+    def _on_success(self, state: State, now: float) -> None:
+        if state == State.CLOSED:
+            self._counts.on_success()
+            return
+        if state == State.HALF_OPEN:
+            self._counts.on_success()
+            if self._counts.consecutive_successes >= self._config.max_requests:
+                self._transition(State.CLOSED, now)
+
+    def _on_failure(self, state: State, now: float) -> None:
+        if state == State.CLOSED:
+            self._counts.on_failure()
+            if self._ready_to_trip(self._counts):
+                self._transition(State.OPEN, now)
+            return
+        if state == State.HALF_OPEN:
+            self._counts.on_failure()
+            self._transition(State.OPEN, now)
+
+    def _ready_to_trip(self, counts: Counts) -> bool:
+        if counts.requests < self._config.min_requests:
+            return False
+        ratio = counts.total_failures / counts.requests
+        should_trip = ratio >= self._config.failure_ratio
+        if should_trip:
+            _log.with_fields(
+                {
+                    "breaker": self._config.name,
+                    "requests": counts.requests,
+                    "failures": counts.total_failures,
+                    "ratio": round(ratio, 4),
+                }
+            ).warnf(
+                "[CIRCUIT-BREAKER] %s: Tripping circuit - Requests: %d, "
+                "Failures: %d, Ratio: %.2f",
+                self._config.name,
+                counts.requests,
+                counts.total_failures,
+                ratio,
+            )
+        return should_trip
+
+    def _current_state(self, now: float) -> tuple[State, int]:
+        if self._state == State.CLOSED:
+            if self._expiry and now >= self._expiry:
+                self._roll_generation(now)
+            return self._state, self._generation
+        if self._state == State.OPEN and now >= self._expiry:
+            self._transition(State.HALF_OPEN, now)
+        return self._state, self._generation
+
+    def _transition(self, new_state: State, now: float) -> None:
+        if new_state == self._state:
+            return
+        from_state = self._state
+        self._state = new_state
+        self._generation += 1
+        self._counts.clear()
+        self._expiry = self._compute_expiry(new_state, now)
+
+        msg = (
+            f"[CIRCUIT-BREAKER] {self._config.name}: State changed from "
+            f"{from_state.value} to {new_state.value}"
+        )
+        entry = _log.with_fields(
+            {
+                "breaker": self._config.name,
+                "from": from_state.value,
+                "to": new_state.value,
+            }
+        )
+        if from_state == State.CLOSED and new_state == State.OPEN:
+            entry.warn(msg)
+        else:
+            entry.info(msg)
+
+        callback = self._config.on_state_change
+        if callback is not None:
+            try:
+                callback(self._config.name, from_state.value, new_state.value)
+            except Exception as cb_exc:
+                _log.with_error(cb_exc).errorf(
+                    "[CIRCUIT-BREAKER] %s: state-change callback raised",
+                    self._config.name,
+                )
+
+    def _roll_generation(self, now: float) -> None:
+        self._generation += 1
+        self._counts.clear()
+        self._expiry = self._compute_expiry(State.CLOSED, now)
+
+    def _compute_initial_expiry(self) -> float:
+        now = _monotonic()
+        return self._compute_expiry(State.CLOSED, now)
+
+    def _compute_expiry(self, state: State, now: float) -> float:
+        if state == State.CLOSED:
+            if self._config.interval <= 0:
+                return 0.0
+            return now + self._config.interval
+        if state == State.OPEN:
+            return now + self._config.timeout
+        return 0.0
+
+
+def new_breaker(config: Config) -> Breaker:
+    return Breaker(config)
+
+
+class BreakerStatus(BaseModel):
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    name: str = Field(alias="name")
+    state: str = Field(alias="state")
+    requests: int = Field(alias="requests")
+    total_successes: int = Field(alias="total_successes")
+    total_failures: int = Field(alias="total_failures")
+    consecutive_successes: int = Field(alias="consecutive_successes")
+    consecutive_failures: int = Field(alias="consecutive_failures")
+
+
+class Manager:
+
+    __slots__ = ("_breakers", "_lock")
+
+    def __init__(self) -> None:
+        self._breakers: dict[str, Breaker] = {}
+        self._lock = threading.RLock()
+
+    def get_or_create(self, name: str, config: Config) -> Breaker:
+        with self._lock:
+            existing = self._breakers.get(name)
+            if existing is not None:
+                return existing
+            if config.name != name:
+                config = config.model_copy(update={"name": name})
+            breaker = Breaker(config)
+            self._breakers[name] = breaker
+            _log.with_field("breaker", name).infof(
+                "[CIRCUIT-BREAKER] Created new circuit breaker: %s", name
+            )
+            return breaker
+
+    def get(self, name: str) -> Breaker | None:
+        with self._lock:
+            return self._breakers.get(name)
+
+    def get_all(self) -> dict[str, Breaker]:
+        with self._lock:
+            return dict(self._breakers)
+
+    def status(self) -> dict[str, BreakerStatus]:
+        with self._lock:
+            result: dict[str, BreakerStatus] = {}
+            for name, breaker in self._breakers.items():
+                counts = breaker.counts()
+                result[name] = BreakerStatus(
+                    name=name,
+                    state=breaker.state().value,
+                    requests=counts.requests,
+                    total_successes=counts.total_successes,
+                    total_failures=counts.total_failures,
+                    consecutive_successes=counts.consecutive_successes,
+                    consecutive_failures=counts.consecutive_failures,
+                )
+            return result
+
+
+def new_manager() -> Manager:
+    return Manager()
+
+
+def to_app_error(exc: BaseException) -> AppError:
+    if isinstance(exc, CircuitOpenError):
+        return exc.app_error
+    if isinstance(exc, AppError):
+        return exc
+    return wrap(exc, ErrorCategory.INTERNAL, "CB_UNEXPECTED", str(exc))
+
+
+__all__ = [
+    "Breaker",
+    "BreakerStatus",
+    "CircuitOpenError",
+    "Config",
+    "Counts",
+    "ErrCircuitOpen",
+    "ErrServiceUnavailable",
+    "ErrTooManyRequests",
+    "Manager",
+    "State",
+    "StateChangeCallback",
+    "default_config",
+    "new_breaker",
+    "new_manager",
+    "to_app_error",
+]
