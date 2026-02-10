@@ -1,0 +1,93 @@
+# Copyright 2025-2026 coRAN LABS Private Limited
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+hypothesis:
+  min_correlation_ratio: 2.0
+
+scoring:
+  lte:
+    mod_priority: ["mod3", "mod30"]
+    enable_mod6: false
+  nr:
+    mod_priority: ["mod3", "mod4", "mod30"]
+  headroom_hops: 5
+
+shadow_nrt:
+  enabled: true
+  distance_thresholds_m:
+    macro_macro: 3000
+    macro_small: 1500
+    small_small: 500
+    indoor_any:  200
+  require_same_frequency: true
+  require_same_technology: true
+
+convergence:
+  max_passes: 5
+  min_soft_cost_improvement: 0.01
+  per_pass_budget_pct: 0.005
+  per_run_budget_pct:  0.01
+  max_absolute_changes: 50
+
+pools:
+  lte:
+    macro:    [0, 200]
+    small:    [200, 400]
+    indoor:   [400, 504]
+    reserved: []
+  nr:
+    macro:    [0, 400]
+    small:    [400, 700]
+    indoor:   [700, 900]
+    reserved: [900, 1008]
+
+rollback:
+  hosr_drop_threshold_pp: 1.0
+  monitor_window_hours:   24
+
+sdnr:
+  enabled: true
+  base_url: "http://sdnc.onap.svc.cluster.local:8282"
+  username: ""
+  password: ""
+  netconf_node_id: ""
+  function_id: "1"
+  timeout_s: 30.0
+
+osc:
+  kafka:
+    brokers: "onap-strimzi-kafka-bootstrap.onap.svc.cluster.local:9092"
+    topic: "unauthenticated.SEC_3GPP_PERFORMANCEASSURANCE_OUTPUT"
+    group_id: "pci-planning-rapp"
+    username: "pci-planning-rapp"
+    password: ""
+    security_protocol: "SASL_PLAINTEXT"
+
+  sftp:
+    enabled: true
+    timeout_seconds: 30.0
+    max_idle_seconds: 300.0
+    cleanup_interval_seconds: 60.0
+
+  pm_directory: ""
+
+  max_files_per_refresh: 5000
+
+history_file: "runs/history.json"
+
+influxdb:
+  enabled: false
+  url: "http://localhost:8087"
+  org: "pci-rapp"
+  bucket: "pci_planning_and_optimization"

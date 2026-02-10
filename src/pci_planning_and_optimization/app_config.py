@@ -186,3 +186,77 @@ class AppConfig(BaseModel):
     history_file: str = ""
 
 
+PLACEHOLDER_PREFIX = "REPLACE_WITH"
+
+
+def unfilled(cfg: AppConfig) -> list[str]:
+    gaps: list[str] = []
+
+    def needs(value: str, env: str, effect: str) -> None:
+        v = (value or "").strip()
+        if not v or v.startswith(PLACEHOLDER_PREFIX):
+            gaps.append(f"{env} — {effect}")
+
+    if not cfg.osc.pm_directory:
+        needs(cfg.osc.kafka.brokers, "KAFKA_BROKERS", "no PM files are ingested")
+        if cfg.osc.kafka.username:
+            needs(cfg.osc.kafka.password, "KAFKA_PASSWORD", "the Kafka consumer cannot authenticate")
+    if cfg.sdnr.enabled:
+        needs(cfg.sdnr.base_url, "SDNR_BASE_URL", "approved PCI changes are not written back")
+        needs(cfg.sdnr.username, "SDNR_USERNAME", "approved PCI changes are not written back")
+        needs(cfg.sdnr.password, "SDNR_PASSWORD", "approved PCI changes are not written back")
+    if cfg.influxdb.enabled:
+        needs(cfg.influxdb.token, "INFLUX_TOKEN", "time-series storage is disabled")
+    return gaps
+
+
+def load_config(path: str | Path) -> AppConfig:
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"Config file not found: {p}")
+    with p.open("r", encoding="utf-8") as f:
+        raw = yaml.safe_load(f) or {}
+    cfg = AppConfig.model_validate(raw)
+    _apply_env_overrides(cfg)
+    return cfg
+
+
+def _apply_env_overrides(cfg: AppConfig) -> None:
+    for env_name, target, attr in (
+        ("KAFKA_BROKERS", cfg.osc.kafka, "brokers"),
+        ("KAFKA_TOPIC", cfg.osc.kafka, "topic"),
+        ("KAFKA_GROUP_ID", cfg.osc.kafka, "group_id"),
+        ("KAFKA_USERNAME", cfg.osc.kafka, "username"),
+        ("KAFKA_PASSWORD", cfg.osc.kafka, "password"),
+        ("KAFKA_SECURITY_PROTOCOL", cfg.osc.kafka, "security_protocol"),
+        ("PM_DIRECTORY", cfg.osc, "pm_directory"),
+        ("PCI_HISTORY_FILE", cfg, "history_file"),
+        ("SDNR_BASE_URL", cfg.sdnr, "base_url"),
+        ("SDNR_USERNAME", cfg.sdnr, "username"),
+        ("SDNR_PASSWORD", cfg.sdnr, "password"),
+        ("SDNR_NETCONF_NODE_ID", cfg.sdnr, "netconf_node_id"),
+        ("SDNR_FUNCTION_ID", cfg.sdnr, "function_id"),
+    ):
+        v = os.getenv(env_name)
+        if v:
+            setattr(target, attr, v)
+
+    v = os.getenv("SDNR_ENABLED")
+    if v:
+        cfg.sdnr.enabled = v.lower() in {"1", "true", "yes", "on"}
+
+    v = os.getenv("INFLUX_URL")
+    if v:
+        cfg.influxdb.url = v
+    v = os.getenv("INFLUX_TOKEN")
+    if v:
+        cfg.influxdb.token = v
+    v = os.getenv("INFLUX_ORG")
+    if v:
+        cfg.influxdb.org = v
+    v = os.getenv("INFLUX_BUCKET")
+    if v:
+        cfg.influxdb.bucket = v
+    v = os.getenv("INFLUX_ENABLED")
+    if v:
+        cfg.influxdb.enabled = v.lower() in {"1", "true", "yes", "on"}
