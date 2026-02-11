@@ -202,3 +202,157 @@ def detect_collisions(network: Network, technology: Technology) -> list[Conflict
     return _sort_conflicts(conflicts)
 
 
+def detect_confusions(network: Network, technology: Technology) -> list[ConflictEdge]:
+    conflicts: list[ConflictEdge] = []
+    real_neighbors = _real_neighbor_map(network)
+    for a, b, source in _iter_intra_tech_pairs(network, technology):
+        if a.pci == b.pci:
+            continue
+
+        is_confusion = False
+        for source_cell, target in ((a, b), (b, a)):
+            for nb_id in real_neighbors.get(source_cell.id, ()):
+                if nb_id == target.id:
+                    continue
+                nb = network.cells.get(nb_id)
+                if nb is None or nb.technology != technology:
+                    continue
+                if nb.pci != target.pci:
+                    continue
+                if nb.primary_frequency() != target.primary_frequency():
+                    continue
+                is_confusion = True
+                break
+            if is_confusion:
+                break
+
+        if not is_confusion:
+            continue
+        conflicts.append(_build_edge(
+            network, a, b, relation_source=source, conflict_class=CLASS_CONFUSION,
+        ))
+    return _sort_conflicts(conflicts)
+
+
+def compute_modN_violations(
+    network: Network, technology: Technology, n: int
+) -> list[ConflictEdge]:
+    if n <= 0:
+        raise ValueError(f"compute_modN_violations: n must be positive, got {n}")
+    label = f"mod{n}"
+
+    conflicts: list[ConflictEdge] = []
+    for a, b, source in _iter_intra_tech_pairs(network, technology):
+        if (a.pci % n) != (b.pci % n):
+            continue
+        conflicts.append(_build_edge(
+            network, a, b, relation_source=source, conflict_class=label,
+        ))
+    return _sort_conflicts(conflicts)
+
+
+def prepare_network(network: Network, config: AppConfig) -> Network:
+    if not config.shadow_nrt.enabled:
+        _log.info("shadow_nrt.enabled=false — skipping shadow-NRT injection")
+        return network
+
+    thresholds = {
+        "macro_macro": float(config.shadow_nrt.distance_thresholds_m.macro_macro),
+        "macro_small": float(config.shadow_nrt.distance_thresholds_m.macro_small),
+        "small_small": float(config.shadow_nrt.distance_thresholds_m.small_small),
+        "indoor_any": float(config.shadow_nrt.distance_thresholds_m.indoor_any),
+    }
+    added = network.add_shadow_relations(thresholds)
+    _log.info(
+        "shadow-NRT: added %d directed rows (%.0f logical pairs)",
+        added, added / 2 if added else 0,
+    )
+    return network
+
+
+def _modN_list_for_technology(
+    technology: Technology, *, enable_mod6_lte: bool
+) -> list[int]:
+    if technology == Technology.NR:
+        return [3, 4, 30]
+    return [3, 30, 6] if enable_mod6_lte else [3, 30]
+
+
+def build_g_squared(
+    network: Network,
+    technology: Technology,
+    *,
+    enable_mod6_lte: bool = False,
+) -> nx.Graph:
+    sub_lte, sub_nr = network.split_by_technology()
+    sub = sub_lte if technology == Technology.LTE else sub_nr
+
+    g = nx.Graph()
+    for cell in sub.cells.values():
+        g.add_node(cell.id, cell=cell)
+
+    pair_to_edge: dict[tuple[str, str], ConflictEdge] = {}
+
+    def _maybe_add(edge: ConflictEdge) -> None:
+        key = (edge.cell_a_id, edge.cell_b_id)
+        existing = pair_to_edge.get(key)
+        if existing is None:
+            pair_to_edge[key] = edge
+            return
+        if _CLASS_PRECEDENCE.index(edge.conflict_class) < _CLASS_PRECEDENCE.index(existing.conflict_class):
+            pair_to_edge[key] = edge
+
+    for edge in detect_collisions(sub, technology):
+        _maybe_add(edge)
+    for edge in detect_confusions(sub, technology):
+        _maybe_add(edge)
+    for n in _modN_list_for_technology(technology, enable_mod6_lte=enable_mod6_lte):
+        for edge in compute_modN_violations(sub, technology, n):
+            _maybe_add(edge)
+
+    for edge in pair_to_edge.values():
+        g.add_edge(
+            edge.cell_a_id,
+            edge.cell_b_id,
+            conflict_class=edge.conflict_class,
+            relation_source=edge.relation_source,
+            ho_attempts=edge.ho_attempts,
+            ho_failures=edge.ho_failures,
+            ho_failure_rate=edge.ho_failure_rate,
+            frequency=edge.frequency,
+            distance_m=edge.distance_m,
+            pci_a=edge.pci_a,
+            pci_b=edge.pci_b,
+        )
+
+    return g
+
+
+@dataclass
+class AllConflicts:
+
+    technology: str
+    collisions: list[ConflictEdge] = field(default_factory=list)
+    confusions: list[ConflictEdge] = field(default_factory=list)
+    mod3: list[ConflictEdge] = field(default_factory=list)
+    mod4: list[ConflictEdge] = field(default_factory=list)
+    mod6: list[ConflictEdge] = field(default_factory=list)
+    mod30: list[ConflictEdge] = field(default_factory=list)
+
+
+def all_conflicts(
+    network: Network,
+    technology: Technology,
+    *,
+    enable_mod6_lte: bool = False,
+) -> AllConflicts:
+    out = AllConflicts(technology=technology.value)
+    out.collisions = detect_collisions(network, technology)
+    out.confusions = detect_confusions(network, technology)
+    out.mod3 = compute_modN_violations(network, technology, 3)
+    if technology == Technology.NR:
+        out.mod4 = compute_modN_violations(network, technology, 4)
+    elif enable_mod6_lte:
+        out.mod6 = compute_modN_violations(network, technology, 6)
+    out.mod30 = compute_modN_violations(network, technology, 30)
+    return out
