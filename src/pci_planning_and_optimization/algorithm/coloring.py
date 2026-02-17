@@ -238,3 +238,338 @@ def _lock_neighborhood(
     return newly
 
 
+def _resolve_reason(
+    cell: Cell, bundle: AllConflicts
+) -> tuple[str, str]:
+    cell_id = cell.id
+    for edge in bundle.collisions:
+        if cell_id in (edge.cell_a_id, edge.cell_b_id):
+            partner = edge.cell_b_id if edge.cell_a_id == cell_id else edge.cell_a_id
+            return (
+                REASON_COLLISION,
+                f"Hard PCI collision with {partner} on shared frequency",
+            )
+    for edge in bundle.confusions:
+        if cell_id in (edge.cell_a_id, edge.cell_b_id):
+            partner = edge.cell_b_id if edge.cell_a_id == cell_id else edge.cell_a_id
+            return (
+                REASON_CONFUSION,
+                f"PCI confusion involving {partner}",
+            )
+    return (
+        REASON_MODN,
+        "Mod-N interference reduction with same-frequency neighbors",
+    )
+
+
+def _apply_pci_change(cell: Cell, new_pci: int) -> None:
+    cell.pci = new_pci
+    if cell.technology == Technology.LTE:
+        cell.pci_components = (new_pci // 3, new_pci % 3)
+
+
+def conservative_color_pass(
+    network: Network,
+    technology: Technology,
+    config: AppConfig,
+    weight_provider: WeightProvider,
+    policy: OperatorPolicy,
+    *,
+    per_pass_budget: int,
+    pass_number: int,
+    locked_cells: set[str] | None = None,
+) -> tuple[list[ChangeRecommendation], set[str]]:
+    locked = set(locked_cells) if locked_cells else set()
+
+    bundle = all_conflicts(
+        network, technology, enable_mod6_lte=config.scoring.lte.enable_mod6
+    )
+
+    candidates = _cells_to_consider(network, technology, bundle)
+
+    changes: list[ChangeRecommendation] = []
+
+    for cell in candidates:
+        if len(changes) >= per_pass_budget:
+            _log.info(
+                "[%s] pass %d: per-pass budget %d exhausted",
+                technology.value, pass_number, per_pass_budget,
+            )
+            break
+        if cell.id in locked:
+            continue
+
+        allowed = policy.allowed_pool_for(cell)
+        if not allowed:
+            _log.warning(
+                "[%s] pass %d: pool exhausted for cell %s (cell_type=%s) — skipping",
+                technology.value, pass_number, cell.id, cell.cell_type,
+            )
+            continue
+
+        old_pci = cell.pci
+        old_key = candidate_sort_key(network, cell, old_pci, config.scoring, weight_provider)
+
+        result = pick_pci(cell, allowed, network, config.scoring, weight_provider)
+        if result is None:
+            continue
+        new_pci, new_key = result
+
+        if new_pci == old_pci:
+            continue
+        if new_key >= old_key:
+            continue
+
+        soft_before = compute_total_soft_cost(
+            network, technology, weight_provider, config.scoring
+        )
+        _apply_pci_change(cell, new_pci)
+        soft_after = compute_total_soft_cost(
+            network, technology, weight_provider, config.scoring
+        )
+
+        if soft_after > soft_before:
+            _apply_pci_change(cell, old_pci)
+            _log.info(
+                "[%s] pass %d: cell %s change %d→%d would INCREASE total soft cost "
+                "(%.4f → %.4f) — reverting",
+                technology.value, pass_number, cell.id, old_pci, new_pci,
+                soft_before, soft_after,
+            )
+            continue
+
+        ho_impact = _estimate_ho_avoided(network, cell, old_pci, new_pci, weight_provider)
+
+        newly_locked = _lock_neighborhood(network, cell.id, locked)
+
+        reason_code, reason_text = _resolve_reason(cell, bundle)
+
+        rec = ChangeRecommendation(
+            cell_id=cell.id,
+            technology=cell.technology.value,
+            mo_class=cell.mo_class,
+            pci_old=old_pci,
+            pci_new=new_pci,
+            pci_components_new=(
+                (new_pci // 3, new_pci % 3) if cell.technology == Technology.LTE else None
+            ),
+            reason_code=reason_code,
+            reason_text=reason_text,
+            sort_key_old=old_key,
+            sort_key_new=new_key,
+            predicted_ho_failures_avoided_per_week=ho_impact,
+            pass_number=pass_number,
+            locked_neighborhood=newly_locked,
+        )
+        changes.append(rec)
+        _log.info(
+            "[%s] pass %d: cell %s %d→%d  reason=%s  Δsoft=%.4f  +%s locked",
+            technology.value, pass_number, cell.id, old_pci, new_pci,
+            reason_code, soft_before - soft_after, len(newly_locked),
+        )
+
+    return changes, locked
+
+
+def _estimate_ho_avoided(
+    network: Network,
+    cell: Cell,
+    old_pci: int,
+    new_pci: int,
+    weight_provider: WeightProvider,
+) -> float:
+    neighbors = [
+        n for n in network.neighbors_of(cell.id, same_tech_only=True)
+        if n.primary_frequency() == cell.primary_frequency()
+        and cell.primary_frequency() is not None
+    ]
+    avoided = 0.0
+    for u in neighbors:
+        fwd = network.relation(cell.id, u.id)
+        rev = network.relation(u.id, cell.id)
+        fails = (fwd.ho_failures if fwd else 0) + (rev.ho_failures if rev else 0)
+        if fails == 0:
+            continue
+
+        if old_pci == u.pci and new_pci != u.pci:
+            avoided += 1.0 * fails
+            continue
+        if (old_pci % 3) == (u.pci % 3) and (new_pci % 3) != (u.pci % 3):
+            avoided += 0.4 * fails
+        if cell.technology == Technology.NR and (old_pci % 4) == (u.pci % 4) and (new_pci % 4) != (u.pci % 4):
+            avoided += 0.3 * fails
+        if (old_pci % 30) == (u.pci % 30) and (new_pci % 30) != (u.pci % 30):
+            avoided += 0.3 * fails
+    return avoided
+
+
+def _budget_cells(network: Network, technology: Technology, pct: float) -> int:
+    n = sum(1 for c in network.cells.values() if c.technology == technology)
+    return max(1, int(round(n * pct)))
+
+
+def run_optimization(
+    network: Network,
+    technology: Technology,
+    config: AppConfig,
+    *,
+    weight_provider: WeightProvider | None = None,
+    policy: OperatorPolicy | None = None,
+    max_changes_override: int | None = None,
+) -> OptimizationRun:
+    weight_provider = weight_provider or default_weight_provider(network)
+    policy = policy or OperatorPolicy(config)
+
+    if max_changes_override is not None:
+        per_run_budget = max_changes_override
+    else:
+        per_run_budget = _budget_cells(
+            network, technology, config.convergence.per_run_budget_pct
+        )
+    per_run_budget = min(per_run_budget, config.convergence.max_absolute_changes)
+
+    per_pass_budget = _budget_cells(
+        network, technology, config.convergence.per_pass_budget_pct
+    )
+    if max_changes_override is not None:
+        needed = max(1, (per_run_budget + config.convergence.max_passes - 1) // config.convergence.max_passes)
+        per_pass_budget = max(per_pass_budget, needed)
+
+    all_changes: list[ChangeRecommendation] = []
+    pass_history: list[PassSummary] = []
+    n_cells = sum(1 for c in network.cells.values() if c.technology == technology)
+    last_total = compute_total_soft_cost(
+        network, technology, weight_provider, config.scoring
+    )
+
+    converged = False
+    passes_executed = 0
+
+    for pass_idx in range(config.convergence.max_passes):
+        passes_executed = pass_idx + 1
+
+        if len(all_changes) >= per_run_budget:
+            pass_history.append(PassSummary(
+                pass_number=passes_executed,
+                n_changes=0,
+                soft_cost_before=last_total,
+                soft_cost_after=last_total,
+                improvement=0.0,
+                stopped_reason="run_budget_exhausted",
+            ))
+            _log.info(
+                "[%s] run budget %d exhausted before pass %d",
+                technology.value, per_run_budget, passes_executed,
+            )
+            break
+
+        remaining_budget = per_run_budget - len(all_changes)
+        budget_this_pass = min(per_pass_budget, remaining_budget)
+
+        soft_before = compute_total_soft_cost(
+            network, technology, weight_provider, config.scoring
+        )
+
+        changes, _locked = conservative_color_pass(
+            network, technology, config, weight_provider, policy,
+            per_pass_budget=budget_this_pass,
+            pass_number=passes_executed,
+            locked_cells=None,
+        )
+        all_changes.extend(changes)
+
+        soft_after = compute_total_soft_cost(
+            network, technology, weight_provider, config.scoring
+        )
+        improvement = soft_before - soft_after
+
+        if not changes:
+            pass_history.append(PassSummary(
+                pass_number=passes_executed,
+                n_changes=0,
+                soft_cost_before=soft_before,
+                soft_cost_after=soft_after,
+                improvement=improvement,
+                stopped_reason="converged_no_changes",
+            ))
+            converged = True
+            _log.info(
+                "[%s] pass %d: no changes — CONVERGED",
+                technology.value, passes_executed,
+            )
+            break
+
+        if improvement < config.convergence.min_soft_cost_improvement:
+            pass_history.append(PassSummary(
+                pass_number=passes_executed,
+                n_changes=len(changes),
+                soft_cost_before=soft_before,
+                soft_cost_after=soft_after,
+                improvement=improvement,
+                stopped_reason="insufficient_improvement",
+            ))
+            _log.info(
+                "[%s] pass %d: improvement %.5f < %.5f — STOPPING (oscillation guard)",
+                technology.value, passes_executed,
+                improvement, config.convergence.min_soft_cost_improvement,
+            )
+            break
+
+        pass_history.append(PassSummary(
+            pass_number=passes_executed,
+            n_changes=len(changes),
+            soft_cost_before=soft_before,
+            soft_cost_after=soft_after,
+            improvement=improvement,
+            stopped_reason="continuing",
+        ))
+        last_total = soft_after
+    else:
+        _log.info(
+            "[%s] max_passes %d reached",
+            technology.value, config.convergence.max_passes,
+        )
+
+    final_total = compute_total_soft_cost(
+        network, technology, weight_provider, config.scoring
+    )
+
+    n_pairs = 0
+    seen: set[tuple[str, str]] = set()
+    for r in network.relations:
+        if r.cross_technology:
+            continue
+        a = network.cells.get(r.source_cell_id)
+        b = network.cells.get(r.target_cell_id)
+        if a is None or b is None:
+            continue
+        if a.technology != technology or b.technology != technology:
+            continue
+        x_id, y_id = (a.id, b.id) if a.id < b.id else (b.id, a.id)
+        if (x_id, y_id) in seen:
+            continue
+        seen.add((x_id, y_id))
+        n_pairs += 1
+
+    return OptimizationRun(
+        technology=technology.value,
+        generated_at=datetime.now(UTC).isoformat(timespec="seconds"),
+        n_cells=n_cells,
+        n_pairs_evaluated=n_pairs,
+        passes_executed=passes_executed,
+        converged=converged,
+        final_soft_cost=final_total,
+        changes=all_changes,
+        pass_history=pass_history,
+        config_snapshot={
+            "max_passes": config.convergence.max_passes,
+            "per_pass_budget_pct": config.convergence.per_pass_budget_pct,
+            "per_run_budget_pct": config.convergence.per_run_budget_pct,
+            "max_absolute_changes": config.convergence.max_absolute_changes,
+            "per_run_budget_used": per_run_budget,
+            "min_soft_cost_improvement": config.convergence.min_soft_cost_improvement,
+            "scoring_lte_mod_priority": config.scoring.lte.mod_priority,
+            "scoring_lte_enable_mod6": config.scoring.lte.enable_mod6,
+            "scoring_nr_mod_priority": config.scoring.nr.mod_priority,
+        },
+    )
