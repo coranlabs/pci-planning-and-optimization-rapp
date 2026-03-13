@@ -431,3 +431,123 @@ class SFTPClient:
             raise
 
 
+def _parse_sftp_url(file_url: str) -> tuple[str, str, str, str]:
+    try:
+        parts = urlsplit(file_url)
+    except ValueError as exc:
+        raise new_sftp_error(
+            "URL_PARSE",
+            f"failed to parse SFTP URL: {file_url}",
+            exc,
+        ) from exc
+
+    if parts.scheme != "sftp":
+        raise new_sftp_error(
+            "URL_SCHEME",
+            f"invalid scheme: {parts.scheme} (expected sftp)",
+            None,
+        )
+
+    hostname = parts.hostname
+    if not hostname:
+        raise new_sftp_error(
+            "URL_HOST",
+            "host not provided in SFTP URL",
+            None,
+        )
+
+    port = parts.port if parts.port is not None else _DEFAULT_PORT
+    host_with_port = f"{hostname}:{port}"
+
+    raw_user = parts.username
+    if not raw_user:
+        raise new_sftp_error(
+            "URL_USER",
+            "username not provided in SFTP URL",
+            None,
+        )
+    username = unquote(raw_user)
+
+    password = unquote(parts.password) if parts.password is not None else ""
+
+    filepath = parts.path
+    if not filepath:
+        raise new_sftp_error(
+            "URL_PATH",
+            "file path not provided in SFTP URL",
+            None,
+        )
+
+    return host_with_port, username, password, filepath
+
+
+def _split_host_port(host_with_port: str) -> tuple[str, int]:
+    if host_with_port.startswith("["):
+        closing = host_with_port.find("]")
+        if closing == -1:
+            return host_with_port, _DEFAULT_PORT
+        host = host_with_port[1:closing]
+        rest = host_with_port[closing + 1 :]
+        if rest.startswith(":"):
+            try:
+                return host, int(rest[1:])
+            except ValueError:
+                return host, _DEFAULT_PORT
+        return host, _DEFAULT_PORT
+
+    if ":" in host_with_port:
+        host, _, port_str = host_with_port.rpartition(":")
+        try:
+            return host, int(port_str)
+        except ValueError:
+            return host_with_port, _DEFAULT_PORT
+    return host_with_port, _DEFAULT_PORT
+
+
+def _read_insecure_flag() -> bool:
+    raw = os.environ.get(_ENV_INSECURE_HOSTKEY, "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _resolve_known_hosts_path() -> str:
+    override = os.environ.get(_ENV_KNOWN_HOSTS_PATH, "").strip()
+    if override:
+        return override
+    return str(Path.home() / ".ssh" / "known_hosts")
+
+
+async def _safe_close(
+    conn: SFTPConnection, logger: Logger, host: str
+) -> None:
+    try:
+        try:
+            close_attr: Any = getattr(conn.sftp_client, "exit", None)
+            if close_attr is not None and callable(close_attr):
+                result = close_attr()
+                if asyncio.iscoroutine(result):
+                    await result
+            else:
+                conn.sftp_client.close()
+        except BaseException:
+            pass
+        try:
+            conn.ssh_conn.close()
+            await conn.ssh_conn.wait_closed()
+        except BaseException:
+            pass
+        logger.with_field("host", host).info("[SFTP] Connection closed")
+    except BaseException as exc:
+        logger.with_field("host", host).with_error(exc).warn(
+            "[SFTP] Connection close raised"
+        )
+
+
+_ALL_INTERNAL: Sequence[str] = (
+    "_parse_sftp_url",
+    "_split_host_port",
+    "_read_insecure_flag",
+    "_resolve_known_hosts_path",
+    "_ENV_INSECURE_HOSTKEY",
+    "_ENV_KNOWN_HOSTS_PATH",
+    "_DEFAULT_KEY_PATHS",
+)
