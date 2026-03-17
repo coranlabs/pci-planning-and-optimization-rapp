@@ -100,3 +100,49 @@ Where it does not, a distance and RF-overlap weight takes over. That fallback
 matters: with every weight at zero the mod-N tie-break has nothing to order and
 the verify-and-revert guard silently goes inert.
 
+## Dashboard
+
+Four pages, served from the same process on the same port as the API and probes.
+
+- **Overview** - KPIs across the PCI pool, network throughput, live conflict
+  counts and the incident feed.
+- **Cell Map** - cells projected on their real coordinates with conflict
+  overlays, regional health and per-cell drill-in.
+- **PCI Planning** - import an operator cell plan as a spreadsheet, compare the
+  current PCI assignment against the optimised one, approve or reject each
+  proposed change, and export the result.
+- **Settings** - detection thresholds, appearance, operator identity and
+  notification delivery.
+
+There is no built-in account. Set `RAPP_ADMIN_USERNAME` and `RAPP_ADMIN_PASSWORD`
+(or `RAPP_ADMIN_PASSWORD_HASH` for a pre-computed scrypt hash, so no plaintext
+reaches the environment) or every login is refused. Passwords are stored as
+scrypt and compared with a constant-time comparison; failed logins are throttled
+per client address and locked out after eight failures in ten minutes.
+
+A PM file describes one reporting period and nothing before it, so the throughput
+chart keeps its own rolling total: network-wide DL and UL, one point a minute,
+seven days deep, in `history_file`. That only covers the time this process has
+been up, so the 6h, 24h and 7d ranges start out nearly empty. The file is
+rewritten as the process runs, so seeding it from elsewhere means stopping the
+rApp first.
+
+## Actuation
+
+An approved change is one RESTCONF PATCH to SDNR, which carries it to the cell
+over NETCONF. Each cell's NETCONF mount is derived from the `ManagedElement` in
+its distinguished name, which is how a network of many gNBs is actually
+addressed: one mount per node, named after its ManagedElement. A cell whose
+mount is not connected fails preflight with `mount not connected` before anything
+is sent, rather than writing to the wrong device. Setting `SDNR_NETCONF_NODE_ID`
+pins every write to a single mount instead, which is a lab arrangement, not a
+deployment one.
+
+After a commit the rApp holds the new PCI as a display overlay and watches the PM
+feed for fifteen minutes. If the feed reports the new value the overlay is
+dropped as confirmed; if it does not, the rApp logs `pci_replan_unconfirmed` at
+critical and reverts the display to whatever the feed says. Confirmation requires
+that the equipment being written to is the equipment being measured. Where the
+write path and the PM path lead to different systems, the window will always
+expire, by construction.
+
