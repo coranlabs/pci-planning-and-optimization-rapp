@@ -197,3 +197,244 @@ def parse_meas_obj_ldn(meas_obj_ldn: str) -> tuple[int, int, bool]:
     return sd, sst, (sd > 0 or sst > 0)
 
 
+def _local_name(tag: str) -> str:
+    if tag.startswith("{"):
+        return tag.partition("}")[2]
+    return tag
+
+
+def _children(elem: etree._Element, name: str) -> list[etree._Element]:
+    return [c for c in elem if _local_name(c.tag) == name]
+
+
+def _first_child(elem: etree._Element, name: str) -> etree._Element | None:
+    for c in elem:
+        if _local_name(c.tag) == name:
+            return c
+    return None
+
+
+def _build_meas_collec_file(root: etree._Element) -> MeasCollecFile:
+    header_el = _first_child(root, "fileHeader")
+    file_header = FileHeader()
+    if header_el is not None:
+        sender_el = _first_child(header_el, "fileSender")
+        collec_el = _first_child(header_el, "measCollec")
+        file_header = FileHeader(
+            fileFormatVersion=header_el.get("fileFormatVersion", ""),
+            vendorName=header_el.get("vendorName", ""),
+            file_sender=(
+                FileSender(
+                    localDn=sender_el.get("localDn", ""),
+                    elementType=sender_el.get("elementType", ""),
+                )
+                if sender_el is not None
+                else FileSender()
+            ),
+            meas_collec=(
+                MeasCollec(beginTime=collec_el.get("beginTime", ""))
+                if collec_el is not None
+                else MeasCollec()
+            ),
+        )
+
+    meas_data_list: list[MeasData] = []
+    for md_el in _children(root, "measData"):
+        me_el = _first_child(md_el, "managedElement")
+        managed_element = (
+            ManagedElement(
+                localDn=me_el.get("localDn", ""),
+                userLabel=me_el.get("userLabel", ""),
+                swVersion=me_el.get("swVersion", ""),
+            )
+            if me_el is not None
+            else ManagedElement()
+        )
+
+        meas_info_list: list[MeasInfo] = []
+        for mi_el in _children(md_el, "measInfo"):
+            gran_el = _first_child(mi_el, "granPeriod")
+            gran_period = (
+                GranPeriod(
+                    duration=gran_el.get("duration", ""),
+                    endTime=gran_el.get("endTime", ""),
+                )
+                if gran_el is not None
+                else GranPeriod()
+            )
+
+            meas_types: list[MeasType] = []
+            for mt_el in _children(mi_el, "measType"):
+                p_attr = mt_el.get("p", "0")
+                try:
+                    p_val = int(p_attr)
+                except ValueError:
+                    p_val = 0
+                meas_types.append(MeasType(p=p_val, name=(mt_el.text or "").strip()))
+
+            meas_values: list[MeasValue] = []
+            for mv_el in _children(mi_el, "measValue"):
+                results: list[MeasResult] = []
+                for r_el in _children(mv_el, "r"):
+                    rp_attr = r_el.get("p", "0")
+                    try:
+                        rp_val = int(rp_attr)
+                    except ValueError:
+                        rp_val = 0
+                    results.append(MeasResult(p=rp_val, value=r_el.text or ""))
+                meas_values.append(
+                    MeasValue(
+                        measObjLdn=mv_el.get("measObjLdn", ""),
+                        results=results,
+                        suspect=mv_el.get("suspect", ""),
+                    )
+                )
+
+            meas_info_list.append(
+                MeasInfo(
+                    measInfoId=mi_el.get("measInfoId", ""),
+                    gran_period=gran_period,
+                    meas_types=meas_types,
+                    meas_values=meas_values,
+                )
+            )
+
+        meas_data_list.append(
+            MeasData(managed_element=managed_element, meas_info=meas_info_list)
+        )
+
+    return MeasCollecFile(file_header=file_header, meas_data=meas_data_list)
+
+
+class XMLParser:
+
+    __slots__ = ("_logger",)
+
+    def __init__(self, logger: Logger | None = None) -> None:
+        self._logger = logger if logger is not None else with_component("xml_parser")
+
+    def parse(self, xml_data: bytes, filename: str = "") -> PMData:
+        with trace_xml_parse(filename or ""):
+            try:
+                parser = etree.XMLParser(resolve_entities=False, no_network=True)
+                root = etree.fromstring(xml_data, parser=parser)
+            except etree.XMLSyntaxError as exc:
+                raise new(
+                    ErrorCategory.PARSE,
+                    "XML_UNMARSHAL",
+                    f"failed to unmarshal XML: {exc}",
+                ).with_component("xml_parser").with_cause(exc) from exc
+            except (ValueError, TypeError) as exc:
+                raise new(
+                    ErrorCategory.PARSE,
+                    "XML_UNMARSHAL",
+                    f"failed to unmarshal XML: {exc}",
+                ).with_component("xml_parser").with_cause(exc) from exc
+
+            if _local_name(root.tag) != "measCollecFile":
+                err = new(
+                    ErrorCategory.PARSE,
+                    "XML_ROOT",
+                    f"unexpected root element: {_local_name(root.tag)!r} "
+                    "(expected 'measCollecFile')",
+                ).with_component("xml_parser")
+                raise err
+
+            try:
+                meas_file = _build_meas_collec_file(root)
+            except Exception as exc:
+                raise new(
+                    ErrorCategory.PARSE,
+                    "XML_UNMARSHAL",
+                    f"failed to unmarshal XML: {exc}",
+                ).with_component("xml_parser").with_cause(exc) from exc
+
+            self._logger.with_fields(
+                {
+                    "fileFormat": meas_file.file_header.file_format_version,
+                    "vendor": meas_file.file_header.vendor_name,
+                    "source": meas_file.file_header.file_sender.local_dn,
+                    "elementType": meas_file.file_header.file_sender.element_type,
+                }
+            ).debug("Parsing 3GPP PM XML file")
+
+            pm_data = PMData(
+                source_name=extract_source_name(
+                    meas_file.file_header.file_sender.local_dn
+                ),
+                begin_time=meas_file.file_header.meas_collec.begin_time,
+            )
+
+            for meas_data in meas_file.meas_data:
+                for meas_info in meas_data.meas_info:
+                    pm_data.end_time = meas_info.gran_period.end_time
+                    pm_data.granularity_period = meas_info.gran_period.duration
+
+                    meas_type_map: dict[int, str] = {
+                        mt.p: mt.name for mt in meas_info.meas_types
+                    }
+
+                    for meas_value in meas_info.meas_values:
+                        sd, sst, ok = parse_meas_obj_ldn(meas_value.meas_obj_ldn)
+                        if ok:
+                            if pm_data.slice_sd == 0 and sd > 0:
+                                pm_data.slice_sd = sd
+                            if pm_data.slice_sst == 0 and sst > 0:
+                                pm_data.slice_sst = sst
+                            self._logger.with_fields(
+                                {
+                                    "slice_sd": sd,
+                                    "slice_sst": sst,
+                                    "measObjLdn": meas_value.meas_obj_ldn,
+                                }
+                            ).debug("[XML] Extracted slice identifier from PM data")
+
+                        for result in meas_value.results:
+                            meas_type_name = meas_type_map.get(result.p, "")
+                            if meas_type_name == "":
+                                continue
+
+                            pm_data.per_object.setdefault(
+                                meas_value.meas_obj_ldn, {}
+                            )[meas_type_name] = result.value
+
+                            try:
+                                value = parse_float_value(result.value)
+                            except ValueError:
+                                self._logger.with_fields(
+                                    {
+                                        "measType": meas_type_name,
+                                        "value": result.value,
+                                    }
+                                ).debug("[XML] Non-numeric measurement kept as text")
+                                continue
+
+                            pm_data.measurements[meas_type_name] = value
+
+                            self._logger.with_fields(
+                                {
+                                    "measType": meas_type_name,
+                                    "value": value,
+                                    "object": meas_value.meas_obj_ldn,
+                                }
+                            ).debug("[XML] Extracted measurement")
+
+            self._logger.with_fields(
+                {
+                    "source": pm_data.source_name,
+                    "measurements": len(pm_data.measurements),
+                }
+            ).debug("[XML] Successfully parsed 3GPP PM data")
+
+            if pm_data.measurements:
+                self._logger.with_fields(
+                    {
+                        "source": pm_data.source_name,
+                        "totalCount": len(pm_data.measurements),
+                    }
+                ).debug("[XML] PM measurement data extracted")
+            else:
+                self._logger.warn("[XML] No measurements found in XML file")
+
+            return pm_data
+
