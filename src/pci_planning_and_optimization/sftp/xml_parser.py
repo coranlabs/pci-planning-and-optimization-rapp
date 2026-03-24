@@ -438,3 +438,137 @@ class XMLParser:
 
             return pm_data
 
+    def extract_all_dl_kpis(self, pm_data: PMData) -> None:
+        for meas_type, value in pm_data.measurements.items():
+            if "DRB.UEThpDl" in meas_type:
+                pm_data.throughput_dl = value
+                self._logger.with_fields(
+                    {"measType": meas_type, "value": value, "unit": "kbps"}
+                ).debug("Found DL throughput")
+            elif "DRB.UEThpUl" in meas_type:
+                pm_data.throughput_ul = value
+                self._logger.with_fields(
+                    {"measType": meas_type, "value": value, "unit": "kbps"}
+                ).debug("Found UL throughput")
+            elif "RRU.PrbTotDl" in meas_type:
+                pm_data.prb_used_dl = value
+                self._logger.with_fields(
+                    {"measType": meas_type, "value": value}
+                ).debug("Found DL PRB usage")
+            elif "DRB.MeanActiveUeDl" in meas_type:
+                pm_data.mean_active_ue_dl = value
+                self._logger.with_fields(
+                    {"measType": meas_type, "value": value}
+                ).debug("Found Mean Active UE DL")
+            elif "DRB.MaxActiveUeDl" in meas_type:
+                pm_data.max_active_ue_dl = value
+                self._logger.with_fields(
+                    {"measType": meas_type, "value": value}
+                ).debug("Found Max Active UE DL")
+            elif "DRB.MeanActiveUeUl" in meas_type:
+                pm_data.mean_active_ue_ul = value
+                self._logger.with_fields(
+                    {"measType": meas_type, "value": value}
+                ).debug("Found Mean Active UE UL")
+            elif "DRB.MaxActiveUeUl" in meas_type:
+                pm_data.max_active_ue_ul = value
+                self._logger.with_fields(
+                    {"measType": meas_type, "value": value}
+                ).debug("Found Max Active UE UL")
+            elif "QOS.BLER" in meas_type:
+                pm_data.bler = value
+                self._logger.with_fields(
+                    {"measType": meas_type, "value": value, "unit": "ratio (0.0-1.0)"}
+                ).debug("Found BLER")
+            elif "QOS.CQI" in meas_type:
+                pm_data.cqi = value
+                self._logger.with_fields(
+                    {"measType": meas_type, "value": value, "unit": "0-15 scale"}
+                ).debug("Found CQI")
+            elif "QOS.HOLDelay" in meas_type:
+                pm_data.hol_delay = value
+                self._logger.with_fields(
+                    {"measType": meas_type, "value": value, "unit": "microseconds"}
+                ).debug("Found HOL Delay")
+            elif "QOS.SINR" in meas_type or "MAC.SINR" in meas_type:
+                pm_data.sinr = value
+                self._logger.with_fields(
+                    {"measType": meas_type, "value": value, "unit": "dB"}
+                ).debug("Found SINR")
+            elif "QOS.RetxRatio" in meas_type or "MAC.RetxRatio" in meas_type:
+                pm_data.retx_ratio = value
+                self._logger.with_fields(
+                    {"measType": meas_type, "value": value, "unit": "ratio (0.0-1.0)"}
+                ).debug("Found RetxRatio")
+            elif "QOS.TxBufferBytes" in meas_type or "RLC.TxBuffer" in meas_type:
+                pm_data.tx_buffer_bytes = value
+                self._logger.with_fields(
+                    {"measType": meas_type, "value": value, "unit": "bytes"}
+                ).debug("Found TxBuffer")
+            elif "user-equipment-average-throughput-downlink" in meas_type:
+                pm_data.throughput_dl = value
+                self._logger.with_fields(
+                    {"measType": meas_type, "value": value}
+                ).debug("Found DL throughput (alternative)")
+            elif "user-equipment-average-throughput-uplink" in meas_type:
+                pm_data.throughput_ul = value
+                self._logger.with_fields(
+                    {"measType": meas_type, "value": value}
+                ).debug("Found UL throughput (alternative)")
+
+        self._logger.with_fields(
+            {
+                "throughputDL": pm_data.throughput_dl,
+                "throughputUL": pm_data.throughput_ul,
+                "prbUsedDL": pm_data.prb_used_dl,
+                "meanActiveUeDL": pm_data.mean_active_ue_dl,
+                "maxActiveUeDL": pm_data.max_active_ue_dl,
+                "bler": pm_data.bler,
+                "cqi": pm_data.cqi,
+                "holDelay": pm_data.hol_delay,
+                "sinr": pm_data.sinr,
+                "retxRatio": pm_data.retx_ratio,
+                "txBufferBytes": pm_data.tx_buffer_bytes,
+                "unit": "kbps/count/ratio/us/dB/bytes",
+            }
+        ).debug("[XML] Extracted all 8 KPIs from PM data")
+
+    def extract_throughput(self, pm_data: PMData) -> tuple[float, float]:
+        self.extract_all_dl_kpis(pm_data)
+        return pm_data.throughput_dl, pm_data.throughput_ul
+
+    def get_all_measurements(self, pm_data: PMData) -> str:
+        lines = [
+            f"Source: {pm_data.source_name}",
+            f"Time: {pm_data.begin_time} - {pm_data.end_time}",
+            f"Granularity: {pm_data.granularity_period}",
+            "Measurements:",
+        ]
+        for meas_type, value in pm_data.measurements.items():
+            lines.append(f"  {meas_type}: {value:.2f}")
+        return "\n".join(lines) + "\n"
+
+
+def new_xml_parser(logger: Logger | None = None) -> XMLParser:
+    return XMLParser(logger=logger)
+
+
+__all__ = [
+    "FileHeader",
+    "FileSender",
+    "GranPeriod",
+    "ManagedElement",
+    "MeasCollec",
+    "MeasCollecFile",
+    "MeasData",
+    "MeasInfo",
+    "MeasResult",
+    "MeasType",
+    "MeasValue",
+    "PMData",
+    "XMLParser",
+    "extract_source_name",
+    "new_xml_parser",
+    "parse_float_value",
+    "parse_meas_obj_ldn",
+]
