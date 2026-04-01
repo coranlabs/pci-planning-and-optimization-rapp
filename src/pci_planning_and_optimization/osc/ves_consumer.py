@@ -196,3 +196,228 @@ class KafkaConsumer:
             {"consumer": self._consumer_group}
         ).info("[KAFKA] Consumer started")
 
+    async def start_consuming(
+        self, message_queue: asyncio.Queue[PMData]
+    ) -> None:
+        if self._consumer is None:
+            await self.start()
+
+        self._running = True
+        self._stop_event.clear()
+
+        try:
+            while self._running and not self._stop_event.is_set():
+                msg = await self._poll_one()
+                if msg is None:
+                    continue
+
+                err = msg.error() if hasattr(msg, "error") else None
+                if err is not None:
+                    self._is_connected = False
+                    self._logger.with_field("error", str(err)).error(
+                        "[KAFKA] Failed to read message"
+                    )
+                    await asyncio.sleep(_ERROR_BACKOFF_SECONDS)
+                    continue
+
+                self._is_connected = True
+                value = msg.value() if hasattr(msg, "value") else None
+                if value is None:
+                    continue
+
+                offset = msg.offset() if hasattr(msg, "offset") else -1
+                partition = msg.partition() if hasattr(msg, "partition") else -1
+                self._logger.with_fields(
+                    {"offset": offset, "size": len(value)}
+                ).debug("[KAFKA] Received VES message")
+
+                await self._process_message(value, partition, offset, message_queue)
+        except asyncio.CancelledError:
+            self._logger.info("[KAFKA] Consumer cancelled")
+            raise
+        finally:
+            self._running = False
+
+    async def stop(self) -> None:
+        self._running = False
+        self._stop_event.set()
+        await self.close()
+
+    async def close(self) -> None:
+        if self._consumer is None:
+            return
+        consumer = self._consumer
+        self._consumer = None
+        self._is_connected = False
+        try:
+            await asyncio.to_thread(consumer.close)
+            self._logger.info("[KAFKA] Consumer stopped")
+        except Exception as exc:
+            self._logger.with_error(exc).warn("[KAFKA] Error during consumer close")
+
+    def is_connected(self) -> bool:
+        return self._is_connected
+
+    def in_flight_count(self) -> int:
+        return self._in_flight
+
+    def _build_config(self) -> dict[str, Any]:
+        config: dict[str, Any] = {
+            "bootstrap.servers": self._brokers,
+            "group.id": self._consumer_group,
+            "auto.offset.reset": "latest",
+            "enable.auto.commit": True,
+            "auto.commit.interval.ms": 5000,
+            "session.timeout.ms": 30000,
+            "heartbeat.interval.ms": 3000,
+            "fetch.message.max.bytes": 10 * 1024 * 1024,
+            "client.id": f"pci-planning-and-optimization-{self._consumer_group}",
+            "error_cb": self._on_librdkafka_error,
+        }
+
+        if self._username and self._password:
+            config["security.protocol"] = self._security_protocol
+            config["sasl.mechanism"] = "SCRAM-SHA-512"
+            config["sasl.username"] = self._username
+            config["sasl.password"] = self._password
+
+        return config
+
+    def _on_librdkafka_error(self, err: Any) -> None:
+        self._is_connected = False
+        try:
+            self._logger.with_field("error", str(err)).error("[KAFKA] librdkafka error")
+        except Exception:
+            pass
+
+    async def _poll_one(self) -> Any | None:
+        if self._consumer is None:
+            return None
+        consumer = self._consumer
+        try:
+            return await asyncio.to_thread(consumer.poll, _POLL_TIMEOUT_SECONDS)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._is_connected = False
+            self._logger.with_error(exc).error("[KAFKA] poll() raised")
+            await asyncio.sleep(_ERROR_BACKOFF_SECONDS)
+            return None
+
+
+    async def _process_message(
+        self,
+        value: bytes,
+        partition: int,
+        offset: int,
+        message_queue: asyncio.Queue[PMData],
+    ) -> None:
+        async with self._in_flight_lock:
+            self._in_flight += 1
+        try:
+            try:
+                pm_data = await self.parse_ves_event(value)
+            except Exception as exc:
+                self._logger.with_error(exc).error("[KAFKA] Failed to parse VES event")
+                return
+
+            if pm_data is None:
+                return
+
+            span = trace_kafka_consume(self._topic, partition, offset)
+            with span:
+                with_span_kind(SpanKind.CONSUMER)(span)
+
+                self._logger.with_fields(
+                    {
+                        "source": pm_data.source_name,
+                        "objects": len(pm_data.per_object),
+                    }
+                ).info("[KAFKA] Parsed PM file")
+
+                try:
+                    message_queue.put_nowait(pm_data)
+                except asyncio.QueueFull:
+                    self._logger.warn(
+                        "[KAFKA] Message channel full, dropping PM file"
+                    )
+        finally:
+            async with self._in_flight_lock:
+                self._in_flight -= 1
+
+    async def parse_ves_event(self, data: bytes | str) -> PMData | None:
+        try:
+            event = VESEvent.model_validate_json(data)
+        except Exception as exc:
+            raise new_kafka_error(
+                "VES_PARSE",
+                "failed to unmarshal VES event",
+                exc,
+            ) from exc
+
+        header = event.event.common_event_header
+        stnd = event.event.stnd_defined_fields
+
+        if header.domain != "stndDefined":
+            return None
+
+        if header.stnd_defined_namespace != "3GPP-PerformanceAssurance":
+            return None
+
+
+        if not stnd.data.file_info_list:
+            self._logger.with_field("source", header.source_name).debug(
+                "[VES] notification carries no fileInfoList — nothing to fetch"
+            )
+            return None
+
+        file_location = stnd.data.file_info_list[0].file_location
+        if not file_location:
+            return None
+
+        return await self._fetch_and_parse(file_location)
+
+    async def _fetch_and_parse(self, file_location: str) -> PMData | None:
+        sftp = self._sftp_client
+        if sftp is None or not _sftp_enabled(sftp):
+            self._logger.debug("[SFTP] Client disabled, cannot fetch XML file")
+            return None
+
+        try:
+            xml_data = await _maybe_await(sftp.fetch_file(file_location))
+        except Exception as exc:
+            self._logger.with_fields(
+                {"error": str(exc), "file": file_location}
+            ).warn("[SFTP] Failed to fetch XML file (may have expired)")
+            return None
+
+        parser = self._ensure_xml_parser()
+        try:
+            return parser.parse(xml_data, file_location)
+        except Exception as exc:
+            self._logger.with_error(exc).error("[XML] Failed to parse file")
+            return None
+
+    def _ensure_xml_parser(self) -> XMLParser:
+        if self._xml_parser is not None:
+            return self._xml_parser
+        from pci_planning_and_optimization.sftp.xml_parser import XMLParser
+
+        self._xml_parser = XMLParser(self._logger)
+        return self._xml_parser
+
+
+def _sftp_enabled(client: Any) -> bool:
+    checker = getattr(client, "is_enabled", None)
+    if checker is None:
+        return True
+    try:
+        return bool(checker())
+    except Exception:
+        return False
+
+
+async def _maybe_await(value: Any) -> Any:
+    if hasattr(value, "__await__"):
+        return await value
+    return value
