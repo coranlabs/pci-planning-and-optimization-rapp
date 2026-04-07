@@ -132,3 +132,126 @@ class SdnrClient:
         ).encode("utf-8")
         return self._do("PATCH", path, body=body)
 
+    def update_lte_pci(
+        self,
+        cell_urn: str,
+        *,
+        group: int,
+        sub: int,
+        mo_class: str = "EUtranCellFDD",
+    ) -> SdnrResult:
+        if not (0 <= group <= 167):
+            return SdnrResult(
+                ok=False, status=0,
+                note=f"LTE physicalLayerCellIdGroup {group} out of range 0..167",
+            )
+        if not (0 <= sub <= 2):
+            return SdnrResult(
+                ok=False, status=0,
+                note=f"LTE physicalLayerSubCellId {sub} out of range 0..2",
+            )
+        if mo_class == "EUtranCellTDD":
+            ns, list_name = NS_EUTRAN_CELL_TDD, "EUtranCellTDD"
+        else:
+            ns, list_name = NS_EUTRAN_CELL_FDD, "EUtranCellFDD"
+
+        short = _short_id(cell_urn)
+        me = _managed_element(cell_urn, default=short)
+        path = self._build_cell_path(
+            me_name=me, cell_ns=ns, cell_list=list_name,
+            cell_short=short, leaf="attributes", func_urn=cell_urn,
+        )
+        body = json.dumps({
+            f"{ns}:attributes": {
+                "physicalLayerCellIdGroup": int(group),
+                "physicalLayerSubCellId": int(sub),
+            }
+        }).encode("utf-8")
+        return self._do("PATCH", path, body=body)
+
+
+    def _build_cell_path(
+        self, *, me_name: str, cell_ns: str, cell_list: str,
+        cell_short: str, leaf: str, func_urn: str = "",
+    ) -> str:
+        qnode = urllib.parse.quote(self.netconf_node_id, safe="")
+        qme = urllib.parse.quote(me_name, safe="")
+        qcell = urllib.parse.quote(cell_short, safe="")
+
+        func_list, func_ns = _function_for_cell(cell_list)
+        func_id = _function_id(func_urn, func_list) or self.function_id
+        qfunc = urllib.parse.quote(func_id, safe="")
+
+        return (
+            "/rests/data/network-topology:network-topology"
+            "/topology=topology-netconf"
+            f"/node={qnode}"
+            "/yang-ext:mount"
+            f"/{NS_MANAGED_ELEMENT}:ManagedElement={qme}"
+            f"/{func_ns}:{func_list}={qfunc}"
+            f"/{cell_ns}:{cell_list}={qcell}"
+            f"/{leaf}"
+        )
+
+    def _do(self, method: str, path: str, *, body: bytes | None) -> SdnrResult:
+        url = self.base_url + (path if path.startswith("/") else "/" + path)
+        headers = {
+            "Accept": "application/json",
+            "Authorization": self._auth_header,
+        }
+        if body is not None:
+            headers["Content-Type"] = "application/json"
+
+        try:
+            resp = self.transport.request(method, url, headers=headers, body=body)
+        except HttpTransportError as e:
+            _log.warning("SDNR %s %s transport error: %s", method, url, e)
+            return SdnrResult(ok=False, status=0, note=f"transport error: {e}")
+
+        ok = 200 <= resp.status < 300
+        if ok:
+            note = f"{method} {path} -> {resp.status}"
+        else:
+            snippet = resp.text()[:200].replace("\n", " ")
+            note = f"{method} {path} -> {resp.status}: {snippet}"
+        return SdnrResult(ok=ok, status=resp.status, note=note, body=resp.body)
+
+
+def _short_id(urn: str) -> str:
+    if "=" not in urn:
+        return urn
+    return urn.rsplit("=", 1)[1]
+
+
+def _function_for_cell(cell_list: str) -> tuple[str, str]:
+    if cell_list.startswith("EUtran"):
+        return "ENBFunction", NS_ENB_FUNCTION
+    return "GNBDUFunction", NS_GNBDU_FUNCTION
+
+
+def _segment_value(urn: str, key: str) -> str:
+    for seg in urn.split(","):
+        head, sep, value = seg.partition("=")
+        if sep and head.rpartition(":")[2] == key:
+            return value
+    return ""
+
+
+_FUNCTION_ALIASES: dict[str, tuple[str, ...]] = {
+    "ENBFunction": ("ENBFunction", "ENodeBFunction"),
+    "GNBDUFunction": ("GNBDUFunction", "GNBDUFunction"),
+}
+
+
+def _function_id(urn: str, func_list: str) -> str:
+    if not urn:
+        return ""
+    for name in _FUNCTION_ALIASES.get(func_list, (func_list,)):
+        value = _segment_value(urn, name)
+        if value:
+            return value
+    return ""
+
+
+def _managed_element(urn: str, *, default: str) -> str:
+    return _segment_value(urn, "ManagedElement") or default
