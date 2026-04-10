@@ -294,3 +294,167 @@ class InfluxWriter:
             self._note_error("record_optimization_run", e)
 
 
+    def _write_point(self, measurement: str, *, tags: dict[str, str], fields: dict[str, Any]) -> None:
+        if not self._enabled_at_runtime or self._write_api is None:
+            return
+        try:
+            from influxdb_client import Point
+            p = Point(measurement)
+            for k, v in tags.items():
+                if v is None or v == "":
+                    continue
+                p.tag(k, str(v))
+            for k, v in fields.items():
+                if v is None:
+                    continue
+                p.field(k, v)
+            self._write_api.write(bucket=self.cfg.bucket, org=self.cfg.org, record=p)
+            self._writes_ok += 1
+        except Exception as e:
+            self._note_error(f"write[{measurement}]", e)
+
+    def _note_error(self, op: str, err: Exception) -> None:
+        self._write_errors += 1
+        self._last_error = f"{type(err).__name__}: {err}"
+        if _throttle.should_log(f"writer:{op}"):
+            _log.warning("InfluxWriter %s failed: %s", op, self._last_error)
+
+
+@dataclass
+class InfluxReader:
+
+    cfg: InfluxConfig
+    _client: Any = field(default=None, init=False, repr=False)
+    _query_api: Any = field(default=None, init=False, repr=False)
+    _enabled_at_runtime: bool = field(default=False, init=False)
+    _query_errors: int = field(default=0, init=False)
+    _last_error: str | None = field(default=None, init=False)
+
+    def __post_init__(self) -> None:
+        if not _influx_configured(self.cfg, "InfluxReader"):
+            return
+        try:
+            from influxdb_client import InfluxDBClient
+        except ImportError:
+            return
+        try:
+            self._client = InfluxDBClient(
+                url=self.cfg.url,
+                token=self.cfg.token,
+                org=self.cfg.org,
+                timeout=int(self.cfg.write_timeout_s * 1000),
+                enable_gzip=True,
+            )
+            self._query_api = self._client.query_api()
+            self._enabled_at_runtime = True
+        except Exception as e:
+            _log.warning("InfluxReader: init failed (%s: %s)", type(e).__name__, e)
+
+    @property
+    def enabled(self) -> bool:
+        return self._enabled_at_runtime
+
+    def stats(self) -> dict[str, Any]:
+        return {
+            "enabled": self._enabled_at_runtime,
+            "query_errors": self._query_errors,
+            "last_error": self._last_error,
+        }
+
+    def close(self) -> None:
+        try:
+            if self._client is not None:
+                self._client.close()
+        except Exception:
+            pass
+        self._enabled_at_runtime = False
+
+
+    def ping(self) -> tuple[bool, str]:
+        if not self._enabled_at_runtime or self._client is None:
+            return False, "client not initialised"
+        try:
+            health = self._client.health()
+            ok = (getattr(health, "status", "fail") == "pass")
+            note = f"{getattr(health, 'name', 'influxdb')} {getattr(health, 'version', '?')} — {getattr(health, 'message', '')}"
+            return ok, note
+        except Exception as e:
+            self._note_error("ping", e)
+            return False, f"{type(e).__name__}: {e}"
+
+    def query_auth_hash(self, username: str) -> str | None:
+        if not self._enabled_at_runtime:
+            return None
+        safe = username.replace("\\", "").replace('"', "")
+        flux = (
+            f'from(bucket: "{self.cfg.bucket}")'
+            f' |> range(start: -3650d)'
+            f' |> filter(fn: (r) => r._measurement == "auth_user"'
+            f' and r.username == "{safe}" and r._field == "hash")'
+            f' |> last()'
+        )
+        try:
+            tables = self._query_api.query(flux, org=self.cfg.org)
+        except Exception as e:
+            self._note_error("query_auth_hash", e)
+            return None
+        for table in tables:
+            for record in table.records:
+                val = record.get_value()
+                if val:
+                    return str(val)
+        return None
+
+    def query_trend(
+        self,
+        metric: str,
+        *,
+        hours: float = 24.0,
+        max_samples: int = 200,
+    ) -> tuple[list[dict[str, Any]], str | None]:
+        if metric not in S.TREND_METRICS:
+            return [], f"unknown metric: {metric}"
+        if not self._enabled_at_runtime:
+            return [], "disabled"
+
+        measurement, field_name = S.TREND_METRICS[metric]
+        window_seconds = max(1, int((hours * 3600) / max_samples))
+        flux = (
+            f'from(bucket: "{self.cfg.bucket}")'
+            f' |> range(start: -{int(hours * 3600)}s)'
+            f' |> filter(fn: (r) => r._measurement == "{measurement}" and r._field == "{field_name}")'
+            f' |> aggregateWindow(every: {window_seconds}s, fn: mean, createEmpty: false)'
+            f' |> keep(columns: ["_time", "_value"])'
+        )
+        try:
+            tables = self._query_api.query(flux, org=self.cfg.org)
+        except Exception as e:
+            self._note_error("query_trend", e)
+            return [], f"{type(e).__name__}: {e}"
+
+        points: list[dict[str, Any]] = []
+        for table in tables:
+            for record in table.records:
+                ts = record.get_time()
+                val = record.get_value()
+                if ts is None or val is None:
+                    continue
+                points.append({
+                    "ts": ts.timestamp(),
+                    "value": float(val),
+                })
+        return points, None
+
+
+    def _note_error(self, op: str, err: Exception) -> None:
+        self._query_errors += 1
+        self._last_error = f"{type(err).__name__}: {err}"
+        if _throttle.should_log(f"reader:{op}"):
+            _log.warning("InfluxReader %s failed: %s", op, self._last_error)
+
+
+def _short_cell_id(urn: str) -> str:
+    if not urn:
+        return ""
+    eq = urn.rfind("=")
+    return urn[eq + 1:] if eq >= 0 else urn
