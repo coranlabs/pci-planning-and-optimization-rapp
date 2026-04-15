@@ -112,3 +112,107 @@ def _is_secure_request(request: Request) -> bool:
     return request.url.scheme == "https"
 
 
+def _client_ip(request: Request) -> str:
+    return request.client.host if request.client else "?"
+
+
+def _prune_failures(failures: dict[str, tuple[int, float]], now: float) -> None:
+    for ip in [k for k, (_, reset) in failures.items() if now > reset]:
+        failures.pop(ip, None)
+
+
+LOGIN_RATE = RateLimiterConfig(requests_per_second=1.0, burst_size=10)
+
+
+def init_auth(app: FastAPI, ui_dir: Path) -> None:
+    app.state.auth_sessions = {}
+    app.state.auth_failures = {}
+    app.state.login_limiter = RateLimiterManager(default_config=LOGIN_RATE)
+
+    admin_user, admin_hash = admin_credential()
+    if not admin_user:
+        _log.error(
+            "auth: no operator account configured - set %s with %s (or %s). "
+            "Every login is refused until one is set.",
+            ADMIN_USER_ENV, ADMIN_PASSWORD_ENV, ADMIN_HASH_ENV,
+        )
+    else:
+        writer = getattr(app.state, "influx_writer", None)
+        if writer is not None and writer.enabled:
+            writer.write_auth_user(admin_user, admin_hash)
+
+    router = APIRouter()
+
+    login_path = ui_dir / "login.html"
+    login_html = (
+        login_path.read_text(encoding="utf-8") if login_path.is_file()
+        else "<!DOCTYPE html><title>Sign in</title><p>login.html is missing from the UI bundle.</p>"
+    ).replace("__APP_VERSION__", f"v{__version__}")
+
+    @router.get("/login", include_in_schema=False)
+    def login_page() -> HTMLResponse:
+        return HTMLResponse(login_html)
+
+    @router.post("/api/auth/login")
+    async def login(request: Request, payload: dict[str, Any]) -> Response:
+        now = time.time()
+        ip = _client_ip(request)
+        if not app.state.login_limiter.allow(ip):
+            return JSONResponse({"ok": False, "error": "Too many attempts — try again later."},
+                                status_code=429)
+        _prune_failures(app.state.auth_failures, now)
+        count, reset = app.state.auth_failures.get(ip, (0, now + 600))
+        if now > reset:
+            count, reset = 0, now + 600
+        if count >= 8:
+            return JSONResponse({"ok": False, "error": "Too many attempts — try again later."},
+                                status_code=429)
+
+        username = str(payload.get("username", "")).strip().lower()
+        password = str(payload.get("password", ""))
+        stored = _stored_hash(app, username)
+        verified = verify_password(password, stored or _UNKNOWN_USER_HASH)
+        if not stored or not verified:
+            app.state.auth_failures[ip] = (count + 1, reset)
+            _log.warning("auth: failed login for %r from %s", username, ip)
+            return JSONResponse({"ok": False, "error": "Invalid username or password."},
+                                status_code=401)
+
+        app.state.auth_failures.pop(ip, None)
+        token = secrets.token_urlsafe(32)
+        app.state.auth_sessions[token] = (username, now + SESSION_TTL_S)
+        resp = JSONResponse({"ok": True})
+        resp.set_cookie(
+            SESSION_COOKIE, token,
+            max_age=SESSION_TTL_S, httponly=True, samesite="lax",
+            secure=_is_secure_request(request),
+        )
+        _log.info("auth: %s logged in from %s", username, ip)
+        return resp
+
+    @router.post("/api/auth/logout")
+    async def logout(request: Request) -> Response:
+        token = request.cookies.get(SESSION_COOKIE, "")
+        app.state.auth_sessions.pop(token, None)
+        resp = JSONResponse({"ok": True})
+        resp.delete_cookie(SESSION_COOKIE)
+        return resp
+
+    app.include_router(router)
+
+    @app.middleware("http")
+    async def _require_session(request: Request, call_next: Any) -> Response:
+        path = request.url.path
+        if path.startswith(_OPEN_PREFIXES):
+            open_resp: Response = await call_next(request)
+            return open_resp
+        token = request.cookies.get(SESSION_COOKIE, "")
+        session = app.state.auth_sessions.get(token)
+        if session is not None and session[1] > time.time():
+            current_user.set(session[0])
+            resp: Response = await call_next(request)
+            return resp
+        if path.startswith("/api/"):
+            return JSONResponse({"ok": False, "error": "authentication required"},
+                                status_code=401)
+        return RedirectResponse(url="/login")
