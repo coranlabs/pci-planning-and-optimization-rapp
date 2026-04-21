@@ -363,3 +363,138 @@ def _export_rows(
     ]
 
 
+def build_plan(network: Network, config: Any) -> dict[str, Any]:
+    neighbors: dict[str, list[str]] = {cid: [] for cid in network.cells}
+    for r in network.relations:
+        if r.source_cell_id in neighbors:
+            neighbors[r.source_cell_id].append(r.target_cell_id)
+
+    prepare_network(network, config)
+
+    before_cells = _cell_rows(network)
+    before_edges = _edges(network, config)
+
+    plan_cfg = _planning_config(config, len(network.cells))
+
+    changes: list[dict[str, Any]] = []
+    for tech in (Technology.LTE, Technology.NR):
+        if not any(c.technology is tech for c in network.cells.values()):
+            continue
+        run = run_optimization(network, tech, plan_cfg)
+        for ch in run.changes:
+            changes.append({
+                "cell_id": ch.cell_id,
+                "pci_old": ch.pci_old,
+                "pci_new": ch.pci_new,
+                "reason_code": ch.reason_code,
+                "reason_text": ch.reason_text,
+            })
+
+    after_cells = _cell_rows(network)
+    after_edges = _edges(network, config)
+
+    before_keys = {(e["a"], e["b"], e["type"]) for e in before_edges}
+    after_keys = {(e["a"], e["b"], e["type"]) for e in after_edges}
+    for e in after_edges:
+        e["resolved"] = False
+    resolved = [
+        {**e, "resolved": True}
+        for e in before_edges
+        if (e["a"], e["b"], e["type"]) not in after_keys
+    ]
+    after_edges_display = resolved + after_edges
+
+    return {
+        "before": {
+            "cells": before_cells,
+            "edges": before_edges,
+            "summary": _counts(before_edges),
+        },
+        "after": {
+            "cells": after_cells,
+            "edges": after_edges_display,
+            "summary": _counts(after_edges),
+            "resolved_count": len(resolved),
+            "new_count": len(after_keys - before_keys),
+        },
+        "changes": changes,
+        "cell_count": len(after_cells),
+        "export_rows": _export_rows(
+            network, neighbors, {c["id"]: c["pci"] for c in before_cells},
+        ),
+    }
+
+
+class PlanStore:
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._plans: dict[int, dict[str, Any]] = {}
+        self._exports: dict[int, list[tuple[Any, ...]]] = {}
+        self._next_id = 1
+
+    def add(self, filename: str, plan: dict[str, Any]) -> int:
+        with self._lock:
+            plan_id = self._next_id
+            self._next_id += 1
+            plan = dict(plan)
+            self._exports[plan_id] = plan.pop("export_rows", [])
+            self._plans[plan_id] = {"id": plan_id, "filename": filename, **plan}
+            return plan_id
+
+    def get(self, plan_id: int) -> dict[str, Any] | None:
+        with self._lock:
+            return self._plans.get(plan_id)
+
+    def export_rows(self, plan_id: int) -> list[tuple[Any, ...]]:
+        with self._lock:
+            return self._exports.get(plan_id, [])
+
+    def list(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return [
+                {
+                    "id": p["id"],
+                    "filename": p["filename"],
+                    "cell_count": p["cell_count"],
+                    "changes": len(p["changes"]),
+                    "before": p["before"]["summary"],
+                    "after": p["after"]["summary"],
+                }
+                for p in sorted(self._plans.values(), key=lambda p: -p["id"])
+            ]
+
+
+def sample_plans(network: Any, *, min_cells: int = 12) -> list[dict[str, Any]]:
+    if network is None:
+        return []
+    by_region: dict[str, int] = {}
+    for cell in network.cells.values():
+        by_region[cell.region or "Unassigned"] = by_region.get(cell.region or "Unassigned", 0) + 1
+    return [
+        {"id": region, "name": region, "cells": n}
+        for region, n in sorted(by_region.items(), key=lambda kv: -kv[1])
+        if n >= min_cells
+    ]
+
+
+def network_to_plan(network: Any, region: str | None = None) -> Network:
+    cells = [
+        c for c in network.cells.values()
+        if region is None or (c.region or "Unassigned") == region
+    ]
+    keep = {c.id for c in cells}
+    relations = [
+        NeighborRelation(
+            source_cell_id=r.source_cell_id,
+            target_cell_id=r.target_cell_id,
+            ho_attempts=r.ho_attempts,
+            ho_successes=r.ho_successes,
+            ho_failures=r.ho_failures,
+            relation_source=r.relation_source,
+            cross_technology=r.cross_technology,
+        )
+        for r in network.relations
+        if r.source_cell_id in keep and r.target_cell_id in keep
+    ]
+    return Network([c.model_copy(deep=True) for c in cells], relations)
