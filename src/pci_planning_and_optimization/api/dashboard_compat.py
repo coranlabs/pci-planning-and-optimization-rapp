@@ -447,3 +447,244 @@ def build_real_pci_data(
     }
 
 
+def _empty_pci_data(*, mode: str, note: str | None = None) -> dict[str, Any]:
+    return {
+        "CELLS": [], "CONFLICTS": [], "ALERTS": [],
+        "TS": [], "HISTORY": [],
+        "SLICES": [],
+        "KPIS": {
+            "activeCells": 0, "totalCells": 0, "pciConflicts": 0, "pciTotal": 0,
+            "coverage": 0, "coverageDelta": 0, "errorRate": 0, "errorRateDelta": 0,
+            "connectedUe": 0, "connectedUeDelta": 0,
+            "pulse": compute_pulse([], []),
+        },
+        "REGIONS_HEALTH": [],
+        "meta": {"mode": mode, "updated": _utcnow_iso(), "poll_error": note,
+                 "tech": None, "cellsByTech": {"lte": 0, "nr": 0}},
+    }
+
+
+_DEFAULT_SETTINGS: dict[str, str] = {
+    "account_name": "Operator",
+    "account_timezone": "Asia/Kolkata",
+    "theme_mode": "light",
+    "pci_collision_threshold": "0",
+    "pci_confusion_threshold": "1",
+    "bler_threshold": "3.0",
+    "prb_warning": "80",
+    "mod3_detection": "warn_only",
+    "brand_product_name": "PCI Planning and Optimization · rApp",
+    "brand_logo_url": "",
+    "brand_footer": "© 2026 Coran Labs",
+    "brand_support_email": "support@coranlabs.com",
+    "audit_retention_days": "90",
+    "audit_immutable": "off",
+    "notif_desktop": "on",
+    "notif_sound_critical": "on",
+    "notif_sound_minor": "off",
+}
+
+_EXCEL_HEADERS = [
+    "cell_id", "lat", "lng",
+    "site_name", "height_m", "azimuth",
+    "mech_tilt", "elec_tilt",
+    "antenna_model", "antenna_gain_dbi", "beamwidth_deg", "tx_power_dbm",
+]
+
+
+class DashboardData:
+
+    def __init__(
+        self,
+        *,
+        config: Any,
+        network_cache: Any,
+        services_module: Any,
+    ) -> None:
+        self._config = config
+        self._network_cache = network_cache
+        self._services = services_module
+        self._lock = threading.RLock()
+
+        self._settings: dict[str, str] = dict(_DEFAULT_SETTINGS)
+        self._audit: list[dict[str, Any]] = []
+        self._uploads: dict[int, dict[str, Any]] = {}
+        self._next_upload_id = 1
+        self._committed_pci: dict[str, tuple] = {}
+        self._site_overrides: dict[str, dict[str, Any]] = {}
+        self._alert_first_seen: dict[str, str] = {}
+        self._thp = ThroughputHistory(getattr(config, "history_file", "") or "")
+        self._history: dict[str, list[dict[str, Any]]] = {}
+
+        self._log_audit(
+            "dashboard_start", "info",
+            "PCI dashboard started",
+            source="system",
+        )
+
+
+
+    def snapshot(
+        self, tech: str | None = None, ts_range: str | None = None,
+    ) -> dict[str, Any]:
+        cache = self._network_cache
+        if cache is None:
+            return _empty_pci_data(mode="live", note="config not loaded")
+        snap = cache.get()
+        network = self._live_network()
+        conflicts_result = None
+        if network is not None:
+            tech = _resolve_tech(network, tech)
+            try:
+                conflicts_result = self._services.list_conflicts(
+                    network, self._config, page_size=10_000, technology=tech,
+                )
+            except Exception as e:
+                conflicts_result = None
+                _ = e
+        try:
+            prb_warning = float(self._settings.get("prb_warning") or 80)
+        except ValueError:
+            prb_warning = 80.0
+        prb_warning = min(100.0, max(1.0, prb_warning))
+        data = build_real_pci_data(
+            network, conflicts_result,
+            synthesize_coords=self._services.synthesize_coords,
+            alert_first_seen=self._alert_first_seen,
+            tech=tech, prb_warning=prb_warning,
+        )
+        if snap.last_error:
+            data["meta"]["poll_error"] = snap.last_error
+
+        store = getattr(self._network_cache, "pm_store", None)
+        age = getattr(store, "age_seconds", None) if store is not None else None
+        data["meta"]["feed_age_seconds"] = round(age, 1) if age is not None else None
+        data["HISTORY"] = self._record_history(data)
+        if network is not None:
+            self._thp.record_network(network)
+        data["TS"] = self._thp.window(data["meta"]["tech"], ts_range)
+        data["meta"]["ts_range"] = ts_range if ts_range in _TS_RANGES else _TS_DEFAULT
+        return data
+
+    def _record_history(self, data: dict[str, Any]) -> list[dict[str, Any]]:
+        tech = data["meta"].get("tech") or "all"
+        with self._lock:
+            pts = self._history.setdefault(tech, [])
+            now = time.time()
+            if data["CELLS"] and (not pts or now - pts[-1]["ts"] >= _HISTORY_STEP_S):
+                conflicts = data["CONFLICTS"]
+                involved = {cid for cf in conflicts for cid in cf["cells"]}
+                pts.append({
+                    "ts": now,
+                    "iso": datetime.fromtimestamp(now, UTC).isoformat(),
+                    "collision": sum(1 for c in conflicts if c["type"] == "collision"),
+                    "confusion": sum(1 for c in conflicts if c["type"] == "confusion"),
+                    "modn": sum(1 for c in conflicts if c["type"] == "mod3"),
+                    "cells": len(data["CELLS"]),
+                    "conflictCells": len(involved),
+                })
+                del pts[:-_HISTORY_MAX]
+            return list(pts)
+
+
+    def replan_propose(self, cell_id: str) -> dict[str, Any]:
+        return self._live_propose(cell_id)
+
+    def replan_commit(self, cell_id: str, proposed_pci: Any) -> dict[str, Any]:
+        return self._live_commit(cell_id, proposed_pci)
+
+
+    def _live_network(self) -> Any:
+        cache = self._network_cache
+        if cache is None:
+            return None
+        network = cache.get().network
+        if network is not None:
+            self._reapply_overrides(network)
+        return network
+
+    def _reapply_overrides(self, network: Any) -> None:
+        if getattr(network, _APPLIED_MARKER, False):
+            return
+        now = datetime.now(UTC).timestamp()
+        with self._lock:
+            for cell_id, (pci, committed_at) in list(self._committed_pci.items()):
+                cell = network.cells.get(cell_id)
+                if cell is None:
+                    del self._committed_pci[cell_id]
+                    continue
+                if cell.pci == pci:
+                    del self._committed_pci[cell_id]
+                    continue
+                if now - committed_at > _COMMIT_CONFIRM_WINDOW_S:
+                    del self._committed_pci[cell_id]
+                    self._log_audit(
+                        "pci_replan_unconfirmed", "critical",
+                        f"{cell_id}: PCI {pci} was committed to SDNR but the PM feed "
+                        f"still reports {cell.pci} after "
+                        f"{int(_COMMIT_CONFIRM_WINDOW_S // 60)} minutes — showing the "
+                        f"feed's value again",
+                        cell_id=cell_id, pci_old=cell.pci, pci_new=pci, source="system",
+                    )
+                    continue
+                cell.pci = pci
+                if cell.pci_components is not None:
+                    cell.pci_components = (pci // 3, pci % 3)
+
+            for cell_id, fields in self._site_overrides.items():
+                cell = network.cells.get(cell_id)
+                if cell is None:
+                    continue
+                for name, value in fields.items():
+                    setattr(cell, name, value)
+        setattr(network, _APPLIED_MARKER, True)
+
+    def _live_propose(self, cell_id: str) -> dict[str, Any]:
+        network = self._live_network()
+        if network is None:
+            return {"ok": False, "error": "No network snapshot loaded"}
+        cell = network.cells.get(cell_id)
+        if cell is None:
+            return {"ok": False, "error": f"Cell {cell_id} not found"}
+
+        neighbours = network.neighbors_of(cell_id, same_tech_only=True)
+        freq = cell.primary_frequency()
+        same_freq = [n for n in neighbours if n.primary_frequency() == freq]
+        blocked = {n.pci for n in same_freq}
+        blocked_mod3 = {n.pci % 3 for n in same_freq}
+
+        lo, hi = _pci_pool_range(self._config, cell)
+        clean = next(
+            (p for p in range(lo, hi)
+             if p != cell.pci and p not in blocked and (p % 3) not in blocked_mod3),
+            None,
+        )
+        proposed = clean if clean is not None else next(
+            (p for p in range(lo, hi) if p != cell.pci and p not in blocked),
+            None,
+        )
+        if proposed is None:
+            return {"ok": False, "error": "No free PCI in the pool"}
+
+        used_in_pool = {
+            c.pci for c in network.cells.values()
+            if c.primary_frequency() == freq and lo <= c.pci < hi
+        }
+        reasons = [
+            f"clear of {len(same_freq)} co-frequency neighbour"
+            f"{'' if len(same_freq) == 1 else 's'}",
+            f"inside the {cell.cell_type} pool {lo}–{hi - 1}",
+        ]
+        if clean is not None:
+            reasons.append(f"mod-3 residue {proposed % 3} unused by neighbours")
+        return {
+            "ok": True,
+            "cell_id": cell_id,
+            "old_pci": cell.pci,
+            "proposed_pci": proposed,
+            "neighbors_checked": len(same_freq),
+            "free_pcis_remaining": (hi - lo) - len(used_in_pool),
+            "mod3_safe": clean is not None,
+            "reason": " · ".join(reasons),
+        }
+
