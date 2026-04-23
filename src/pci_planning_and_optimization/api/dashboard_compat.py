@@ -688,3 +688,349 @@ class DashboardData:
             "reason": " · ".join(reasons),
         }
 
+    def _sdnr_client_for(self, cell: Any) -> Any:
+        from pci_planning_and_optimization.sdnr import make_sdnr_client
+        from pci_planning_and_optimization.sdnr.client import _managed_element
+
+        client = make_sdnr_client(self._config)
+        if client is not None:
+            return client
+
+        sdnr_cfg = getattr(self._config, "sdnr", None)
+        if not (getattr(sdnr_cfg, "enabled", False) and getattr(sdnr_cfg, "base_url", "")):
+            return None
+        mount = _managed_element(cell.dn or "", default="")
+        if not mount:
+            return None
+
+        from pci_planning_and_optimization.sdnr.client import SdnrClient
+        return SdnrClient(
+            base_url=sdnr_cfg.base_url,
+            username=sdnr_cfg.username,
+            password=sdnr_cfg.password,
+            netconf_node_id=mount,
+            function_id=sdnr_cfg.function_id,
+            timeout_s=sdnr_cfg.timeout_s,
+        )
+
+    def _live_commit(self, cell_id: str, proposed_pci: Any) -> dict[str, Any]:
+        from pci_planning_and_optimization.sdnr import apply_change, preflight
+
+        network = self._live_network()
+        if network is None:
+            return {"ok": False, "error": "No network snapshot loaded"}
+        cell = network.cells.get(cell_id)
+        if cell is None:
+            return {"ok": False, "error": f"Cell {cell_id} not found"}
+        try:
+            new_pci = int(proposed_pci)
+        except (TypeError, ValueError):
+            return {"ok": False, "error": f"proposed_pci is not an integer: {proposed_pci!r}"}
+
+        client = self._sdnr_client_for(cell)
+        if client is None:
+            sdnr_cfg = getattr(self._config, "sdnr", None)
+            if not getattr(sdnr_cfg, "enabled", False):
+                err = ("SDNR writes are disabled (sdnr.enabled=false). "
+                       "Set sdnr.enabled=true to commit PCI changes to the network.")
+            elif not getattr(sdnr_cfg, "base_url", ""):
+                err = "sdnr.base_url is empty — cannot reach SDNR"
+            else:
+                err = (f"no NETCONF mount for {cell_id}: sdnr.netconf_node_id is empty and "
+                       "the cell reported no ManagedElement to fall back on")
+            self._log_audit(
+                "pci_replan_failed", "major",
+                f"PCI re-plan {cell_id} {cell.pci} → {new_pci} not sent: {err}",
+                cell_id=cell_id, pci_old=cell.pci, pci_new=new_pci, source="operator",
+            )
+            return {"ok": False, "error": err}
+
+        ok, note = preflight(client)
+        if not ok:
+            self._log_audit(
+                "pci_replan_failed", "critical",
+                f"SDNR preflight failed for {cell_id}: {note}",
+                cell_id=cell_id, pci_old=cell.pci, pci_new=new_pci, source="operator",
+            )
+            return {"ok": False, "error": f"SDNR preflight failed: {note}"}
+
+        old_pci = cell.pci
+        ok, note = apply_change(_change_record(cell, new_pci), client)
+        self._log_audit(
+            "pci_replan" if ok else "pci_replan_failed",
+            "info" if ok else "critical",
+            (f"PCI change committed to SDNR: {cell_id} {old_pci} → {new_pci}"
+             if ok else f"SDNR write failed for {cell_id}: {note}"),
+            cell_id=cell_id, pci_old=old_pci, pci_new=new_pci, source="operator",
+        )
+        if not ok:
+            return {"ok": False, "error": note}
+
+        with self._lock:
+            self._committed_pci[cell_id] = (
+                new_pci, datetime.now(UTC).timestamp(),
+            )
+        try:
+            delattr(network, _APPLIED_MARKER)
+        except AttributeError:
+            pass
+        self._reapply_overrides(network)
+        return {
+            "ok": True,
+            "cell_id": cell_id,
+            "old_pci": old_pci,
+            "new_pci": new_pci,
+            "sdnr_note": note,
+            "audit_msg": f"PCI re-plan: {cell_id} {old_pci} → {new_pci} (operator commit, SDNR)",
+        }
+
+
+    def _log_audit(
+        self,
+        event_type: str,
+        severity: str,
+        description: str,
+        *,
+        cell_id: str | None = None,
+        pci_old: int | None = None,
+        pci_new: int | None = None,
+        source: str = "system",
+    ) -> None:
+        with self._lock:
+            actor = None if source == "system" else self._actor()
+            self._audit.append({
+                "id": len(self._audit) + 1,
+                "timestamp": _utcnow_iso(),
+                "event_type": event_type,
+                "severity": severity,
+                "cell_id": cell_id,
+                "pci_old": pci_old,
+                "pci_new": pci_new,
+                "description": description,
+                "source": source,
+                "actor": actor,
+            })
+
+    def _actor(self) -> dict[str, str]:
+        from pci_planning_and_optimization.api.auth import current_user
+
+        return {
+            "name": current_user.get("")
+            or self._settings.get("account_name")
+            or "Operator",
+        }
+
+    def add_audit(self, body: dict[str, Any]) -> None:
+        event_type = str(body.get("event_type") or "manual")
+        description = str(body.get("description") or "")
+        if event_type in ("sign_in", "sign_out"):
+            who = self._actor()
+            verb = "signed in" if event_type == "sign_in" else "signed out"
+            description = f"{who['name']} {verb}"
+        self._log_audit(
+            event_type,
+            str(body.get("severity") or "info"),
+            description,
+            cell_id=body.get("cell_id"),
+            pci_old=body.get("pci_old"),
+            pci_new=body.get("pci_new"),
+            source="operator",
+        )
+
+    def get_audit(
+        self,
+        *,
+        page: int = 1,
+        per_page: int = 50,
+        severity: str | None = None,
+        event_type: str | None = None,
+        search: str | None = None,
+    ) -> dict[str, Any]:
+        with self._lock:
+            logs = list(reversed(self._audit))
+
+        if severity:
+            logs = [e for e in logs if e.get("severity") == severity]
+        if event_type:
+            logs = [e for e in logs if e.get("event_type") == event_type]
+        if search:
+            s = search.lower()
+            logs = [
+                e for e in logs
+                if s in (e.get("description") or "").lower()
+                or s in (e.get("cell_id") or "").lower()
+                or s in ((e.get("actor") or {}).get("name") or "").lower()
+            ]
+
+        total = len(logs)
+        start = max(0, (page - 1) * per_page)
+        return {
+            "total": total,
+            "page": page,
+            "per_page": per_page,
+            "logs": logs[start:start + per_page],
+        }
+
+    def audit_stats(self) -> dict[str, Any]:
+        with self._lock:
+            logs = list(self._audit)
+        by_severity: dict[str, int] = {}
+        by_type: dict[str, int] = {}
+        for entry in logs:
+            sv = entry.get("severity", "info")
+            by_severity[sv] = by_severity.get(sv, 0) + 1
+            et = entry.get("event_type", "event")
+            by_type[et] = by_type.get(et, 0) + 1
+        return {"total": len(logs), "by_severity": by_severity, "by_type": by_type}
+
+
+    def get_settings(self) -> dict[str, str]:
+        with self._lock:
+            return dict(self._settings)
+
+    def set_settings(self, body: dict[str, Any]) -> None:
+        with self._lock:
+            for k, v in body.items():
+                self._settings[str(k)] = str(v)
+        self._log_audit(
+            "settings_change", "info",
+            f"Settings updated: {', '.join(sorted(body.keys()))}",
+            source="operator",
+        )
+
+    def excel_template_bytes(self, tech: str | None = None) -> bytes:
+        import openpyxl
+
+        tech_norm = (tech or "").lower()
+        if tech_norm in ("lte", "4g"):
+            source_cells: list[dict[str, Any]] = list(self.snapshot("lte").get("CELLS", []))
+            sheet_title = "LTE Cell Plan"
+        elif tech_norm in ("nr", "5g"):
+            source_cells = list(self.snapshot("nr").get("CELLS", []))
+            sheet_title = "5G NR Cell Plan"
+        else:
+            source_cells = list(self.snapshot().get("CELLS", []))
+            sheet_title = "Site & Antenna Config"
+
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = sheet_title
+        ws.append(_EXCEL_HEADERS)
+        col_widths = [22, 12, 12, 22, 11, 10, 11, 11, 22, 18, 15, 14]
+        for i, w in enumerate(col_widths):
+            ws.column_dimensions[openpyxl.utils.get_column_letter(i + 1)].width = w
+        bold = openpyxl.styles.Font(bold=True)
+        fill_req = openpyxl.styles.PatternFill("solid", fgColor="FFFCE4D6")
+        required_cols = {0, 1, 2, 5}
+        for idx, cell in enumerate(ws[1]):
+            cell.font = bold
+            if idx in required_cols:
+                cell.fill = fill_req
+
+        for i, c in enumerate(source_cells):
+            ws.append([
+                c.get("id"), c.get("lat"), c.get("lng"),
+                c.get("site"), c.get("height_m"), _default_azimuth(c, i),
+                c.get("mech_tilt"), c.get("elec_tilt"),
+                c.get("antenna_model"), c.get("antenna_gain_dbi"),
+                c.get("beamwidth_deg"), c.get("tx_power_dbm"),
+            ])
+
+        buf = io.BytesIO()
+        wb.save(buf)
+        buf.seek(0)
+        return buf.getvalue()
+
+    def full_pool_bytes(self, tech: str | None = None) -> bytes:
+        import openpyxl
+
+        tech_norm = "lte" if (tech or "").lower() in ("lte", "4g") else "nr"
+        pool_size = 504 if tech_norm == "lte" else 1008
+        snap = self.snapshot(tech_norm)
+        cells = list(snap.get("CELLS", []))
+        mod3_cell_ids = {
+            cid for cf in snap.get("CONFLICTS", [])
+            if cf.get("type") == "mod3"
+            for cid in (cf.get("cells") or [])
+        }
+        sheet_title = f"{'LTE' if tech_norm == 'lte' else '5G NR'} PCI Pool (0..{pool_size - 1})"
+
+        by_pci: dict[int, list[dict[str, Any]]] = {}
+        for c in cells:
+            try:
+                p = int(c.get("pci"))
+            except (TypeError, ValueError):
+                continue
+            if 0 <= p < pool_size:
+                by_pci.setdefault(p, []).append(c)
+
+        mod3_pcis: set = set()
+        for c in cells:
+            if c.get("id") in mod3_cell_ids:
+                try:
+                    mod3_pcis.add(int(c["pci"]))
+                except (TypeError, ValueError):
+                    pass
+
+        headers = [
+            "pci", "status", "cell_count", "assigned_cells",
+            "regions", "bands", "arfcns",
+            "mod3", "mod6", "mod30", "notes",
+        ]
+
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = sheet_title
+        ws.append(headers)
+        col_widths = [6, 14, 7, 60, 28, 18, 18, 6, 6, 7, 50]
+        for i, w in enumerate(col_widths):
+            ws.column_dimensions[openpyxl.utils.get_column_letter(i + 1)].width = w
+        bold = openpyxl.styles.Font(bold=True)
+        for cell in ws[1]:
+            cell.font = bold
+        ws.freeze_panes = "A2"
+
+        for pci in range(pool_size):
+            holders = by_pci.get(pci, [])
+            if not holders:
+                status = "unassigned"
+            elif len(holders) > 1:
+                status = "collision"
+            elif pci in mod3_pcis:
+                status = "mod3_cluster"
+            else:
+                status = "in_use"
+
+            ids = [c.get("id", "") for c in holders]
+            regions = sorted({c.get("region") for c in holders if c.get("region")})
+            bands = sorted({str(c.get("band")) for c in holders if c.get("band")})
+            arfcns = sorted({c.get("arfcn") for c in holders if c.get("arfcn")})
+
+            note = ""
+            if status == "collision":
+                shared_arfcns = ", ".join(str(a) for a in arfcns)
+                note = f"PCI {pci} shared by {len(holders)} cells on ARFCN(s) {shared_arfcns}"
+            elif status == "mod3_cluster":
+                note = f"part of a mod-3 group {pci % 3} cluster (reference-signal interference)"
+            elif status == "unassigned":
+                note = "free PCI slot — available for re-plan"
+
+            ws.append([
+                pci,
+                status,
+                len(holders),
+                "; ".join(ids),
+                ", ".join(regions),
+                ", ".join(bands),
+                ", ".join(str(a) for a in arfcns),
+                pci % 3,
+                pci % 6,
+                pci % 30,
+                note,
+            ])
+
+        buf = io.BytesIO()
+        wb.save(buf)
+        buf.seek(0)
+        return buf.getvalue()
+
