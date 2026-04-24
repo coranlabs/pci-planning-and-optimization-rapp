@@ -146,3 +146,51 @@ that the equipment being written to is the equipment being measured. Where the
 write path and the PM path lead to different systems, the window will always
 expire, by construction.
 
+## Configuration
+
+A single YAML file holds the full configuration, and anything secret is supplied
+through the environment instead, which is what the Helm chart does. No password
+belongs in `config/config.yaml`; this repository is public.
+
+| Variable | Sets |
+| --- | --- |
+| `KAFKA_BROKERS` `KAFKA_TOPIC` `KAFKA_GROUP_ID` | VES event source |
+| `KAFKA_USERNAME` `KAFKA_PASSWORD` `KAFKA_SECURITY_PROTOCOL` | SASL/SCRAM credentials |
+| `SFTP_ENABLED` `SFTP_TIMEOUT` `RAPP_SSH_KNOWN_HOSTS` | PM file retrieval |
+| `PM_DIRECTORY` | Read PM XML off disk instead of Kafka and SFTP |
+| `SDNR_ENABLED` `SDNR_BASE_URL` `SDNR_USERNAME` `SDNR_PASSWORD` | PCI write path |
+| `SDNR_NETCONF_NODE_ID` `SDNR_FUNCTION_ID` | Mount and function targeting |
+| `INFLUX_ENABLED` `INFLUX_URL` `INFLUX_TOKEN` `INFLUX_ORG` `INFLUX_BUCKET` | Metric storage |
+| `RAPP_ADMIN_USERNAME` `RAPP_ADMIN_PASSWORD` `RAPP_ADMIN_PASSWORD_HASH` | Operator account |
+| `CONFIG_PATH` `HTTP_PORT` `NODE_ID` `PCI_HISTORY_FILE` | Runtime |
+| `LOG_LEVEL` `RAPP_LOG_FORMAT` `NO_COLOR` | Logging |
+
+Logging defaults to `json`, one object per line, for shipping to a log stack.
+`RAPP_LOG_FORMAT=console` switches to the aligned
+`time  LEVEL │ component  message  key=value` view that `serve` frames with its
+BOOT, READY, SHUTDOWN and STOPPED panels, which is what you want at a terminal.
+`LOG_LEVEL` sets the HTTP server's verbosity; the rApp's own loggers take
+`--log-level`.
+
+A few fields that are easy to get wrong:
+
+- `osc.kafka.username` and `password` - leave both blank to connect
+  unauthenticated, set both for SCRAM-SHA-512. Strimzi generates the password
+  into the `KafkaUser` secret of the same name.
+- `osc.kafka.group_id` must be unique per consumer of the topic. Two rApps
+  sharing one have Kafka split the partitions between them, so each silently
+  sees only part of the network.
+- `osc.sftp` - host and credentials come from the VES `fileLocation` URL, not
+  from static config. Without a host key for each PM SFTP server the rApp refuses
+  to fetch; populate `sftp.knownHosts` with `ssh-keyscan -p <port> -H <host>`.
+- `sdnr.base_url` - the in-cluster address is what a Helm deployment resolves.
+  Running the process outside the cluster, point `SDNR_BASE_URL` at the NodePort.
+
+Every default is the secure one: outbound TLS verified with a TLS 1.2 floor, SFTP
+host keys checked against `known_hosts`, session cookies `HttpOnly` and `Secure`
+over HTTPS, SFTP passwords rendered as `redacted` in logs. Two environment
+variables relax them, and the component logs a warning at startup when they do:
+`RAPP_INSECURE_SSH_HOSTKEY` accepts any SFTP host key, and `RAPP_SSH_KNOWN_HOSTS`
+points the pool at a different file. Report a vulnerability to
+**support@coranlabs.com** rather than opening a public issue.
+
