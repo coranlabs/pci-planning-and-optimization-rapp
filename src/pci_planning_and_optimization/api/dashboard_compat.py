@@ -1034,3 +1034,294 @@ class DashboardData:
         buf.seek(0)
         return buf.getvalue()
 
+    def excel_upload(self, filename: str, raw: bytes, description: str) -> dict[str, Any]:
+        import openpyxl
+
+        try:
+            wb = openpyxl.load_workbook(io.BytesIO(raw), data_only=True)
+            ws = wb.active
+            headers = [
+                str(c.value).strip().lower() if c.value else f"col{i}"
+                for i, c in enumerate(ws[1])
+            ]
+            records: list[dict[str, Any]] = []
+            for row_idx, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
+                if all(v is None for v in row):
+                    continue
+                row_dict = {headers[i]: row[i] for i in range(min(len(headers), len(row)))}
+                rec = _parse_excel_row(row_idx, row_dict)
+                records.append(rec)
+        except Exception as e:
+            return {"error": f"Failed to parse file: {e}"}
+
+        if not records:
+            return {"error": "No data rows found in the file."}
+
+        bad = [r for r in records if not r["valid"]]
+        if bad:
+            return {
+                "ok": False,
+                "error": (
+                    f"Upload rejected — {len(bad)} of {len(records)} rows have "
+                    f"validation errors. Required columns: cell_id, lat, lng, azimuth."
+                ),
+                "invalid_rows": [
+                    {"row": r["row_num"], "cell_id": r["cell_id"] or None,
+                     "reason": r["error_msg"]}
+                    for r in bad[:50]
+                ],
+                "invalid_count": len(bad),
+                "total_rows": len(records),
+            }
+
+        with self._lock:
+            upload_id = self._next_upload_id
+            self._next_upload_id += 1
+            self._uploads[upload_id] = {
+                "id": upload_id,
+                "filename": filename,
+                "upload_time": _utcnow_iso(),
+                "description": description,
+                "row_count": len(records),
+                "applied_at": None,
+                "applied_by": None,
+                "applied_count": 0,
+                "skipped_count": 0,
+                "records": records,
+            }
+        self._log_audit(
+            "excel_upload", "info",
+            f"Site config uploaded: {filename} ({len(records)} rows)",
+            source="operator",
+        )
+        return {"ok": True, "upload_id": upload_id, "rows": len(records)}
+
+    def excel_uploads(self) -> list[dict[str, Any]]:
+        with self._lock:
+            ups = sorted(self._uploads.values(),
+                         key=lambda u: u["upload_time"], reverse=True)
+            return [{
+                "id": u["id"],
+                "filename": u["filename"],
+                "upload_time": u["upload_time"],
+                "description": u["description"],
+                "row_count": u["row_count"],
+                "applied_at": u["applied_at"],
+                "applied_by": u["applied_by"],
+                "applied_count": u["applied_count"],
+                "skipped_count": u["skipped_count"],
+                "status": "applied" if u["applied_at"] else "pending",
+            } for u in ups]
+
+    def excel_records(
+        self, upload_id: int, *, page: int = 1, per_page: int = 50,
+        errors_only: bool = False,
+    ) -> dict[str, Any] | None:
+        with self._lock:
+            up = self._uploads.get(upload_id)
+            if up is None:
+                return None
+            recs = up["records"]
+        if errors_only:
+            recs = [r for r in recs if not r["valid"]]
+        total = len(recs)
+        start = max(0, (page - 1) * per_page)
+        return {
+            "total": total, "page": page, "per_page": per_page,
+            "records": recs[start:start + per_page],
+        }
+
+    def excel_delete(self, upload_id: int) -> bool:
+        with self._lock:
+            if upload_id in self._uploads:
+                del self._uploads[upload_id]
+                return True
+            return False
+
+    _SITE_FIELD_MAP = {
+        "lat": "lat", "lng": "lon", "azimuth": "azimuth", "height_m": "antenna_height",
+    }
+
+    def _live_excel_apply(self, up: dict[str, Any]) -> dict[str, Any]:
+        network = self._live_network()
+        if network is None:
+            return {"ok": False, "error": "No network snapshot loaded"}
+
+        applied: list[dict[str, Any]] = []
+        no_op: list[dict[str, Any]] = []
+        skipped: list[dict[str, Any]] = []
+        unstored: set = set()
+        total_field_changes = 0
+
+        for r in up["records"]:
+            cid = (r.get("cell_id") or "").strip()
+            if not r["valid"]:
+                skipped.append({"row": r["row_num"], "cell_id": cid,
+                                "reason": r["error_msg"] or "invalid row"})
+                continue
+            if not cid:
+                skipped.append({"row": r["row_num"], "reason": "empty cell_id"})
+                continue
+            cell = network.cells.get(cid)
+            if cell is None:
+                skipped.append({"row": r["row_num"], "cell_id": cid,
+                                "reason": "cell not in live network"})
+                continue
+
+            for sheet_name in ("mech_tilt", "elec_tilt", "antenna_model",
+                               "antenna_gain_dbi", "beamwidth_deg", "tx_power_dbm"):
+                if r.get(sheet_name) is not None:
+                    unstored.add(sheet_name)
+
+            changed = {}
+            for sheet_name, model_name in self._SITE_FIELD_MAP.items():
+                value = r.get(sheet_name)
+                if value is None:
+                    continue
+                if getattr(cell, model_name, None) == value:
+                    continue
+                changed[model_name] = value
+
+            if not changed:
+                no_op.append({"row": r["row_num"], "cell_id": cid,
+                              "reason": "all fields already match live cell"})
+                continue
+
+            with self._lock:
+                self._site_overrides.setdefault(cid, {}).update(changed)
+            for model_name, value in changed.items():
+                setattr(cell, model_name, value)
+            total_field_changes += len(changed)
+            applied.append({"row": r["row_num"], "cell_id": cid,
+                            "changed": list(changed), "change_count": len(changed)})
+
+        with self._lock:
+            up["applied_at"] = _utcnow_iso()
+            up["applied_by"] = self._settings.get("account_name", "operator")
+            up["applied_count"] = len(applied)
+            up["skipped_count"] = len(skipped) + len(no_op)
+            filename = up["filename"]
+
+        note = (f'Site config "{filename}" applied: {len(applied)} cells updated, '
+                f"{total_field_changes} field changes, {len(no_op)} no-op, "
+                f"{len(skipped)} skipped")
+        if unstored:
+            note += f" ({', '.join(sorted(unstored))} not stored — no field on the cell model)"
+        self._log_audit("site_config_apply", "info", note, source="operator")
+
+        return {
+            "ok": True,
+            "applied": applied,
+            "no_op": no_op,
+            "skipped": skipped,
+            "applied_count": len(applied),
+            "field_changes": total_field_changes,
+            "skipped_count": len(skipped) + len(no_op),
+            "unstored_columns": sorted(unstored),
+            "new_conflicts": [],
+            "note": note,
+        }
+
+    def excel_apply(self, upload_id: int) -> dict[str, Any] | None:
+        with self._lock:
+            up = self._uploads.get(upload_id)
+            if up is None:
+                return None
+
+        return self._live_excel_apply(up)
+
+
+def _default_azimuth(cell: dict[str, Any], idx: int) -> int:
+    az = cell.get("azimuth")
+    if az is not None:
+        return int(az)
+    sector = cell.get("sector")
+    if isinstance(sector, int) and 1 <= sector <= 6:
+        return ((sector - 1) % 3) * 120 + (60 if sector > 3 else 0)
+    return (idx % 3) * 120
+
+
+def _parse_excel_row(row_idx: int, row_dict: dict[str, Any]) -> dict[str, Any]:
+    def get(keys: list[str]) -> Any:
+        for k in keys:
+            v = row_dict.get(k)
+            if v is not None and str(v).strip() != "":
+                return v
+        return None
+
+    def safe_int(v: Any) -> int | None:
+        try:
+            return int(float(v))
+        except (TypeError, ValueError):
+            return None
+
+    def safe_float(v: Any) -> float | None:
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    def safe_str(v: Any) -> str | None:
+        if v is None:
+            return None
+        s = str(v).strip()
+        return s or None
+
+    cell_id = safe_str(get(["cell_id", "cell id", "cellid", "managed_element", "managedelement"]))
+    lat = safe_float(get(["lat", "latitude"]))
+    lng = safe_float(get(["lng", "lon", "long", "longitude"]))
+    site_name = safe_str(get(["site_name", "site name", "sitename", "site"]))
+    height_m = safe_float(get(["height_m", "height", "height (m)", "antenna_height", "antenna height"]))
+    azimuth = safe_int(get(["azimuth", "azimuth_deg", "az"]))
+    mech_tilt = safe_float(get(["mech_tilt", "mechanical_tilt", "mechanical tilt", "mtilt"]))
+    elec_tilt = safe_float(get(["elec_tilt", "electrical_tilt", "electrical tilt", "etilt", "ret_tilt"]))
+    ant_model = safe_str(get(["antenna_model", "antenna model", "antenna"]))
+    ant_gain = safe_float(get(["antenna_gain_dbi", "antenna gain", "gain_dbi", "gain"]))
+    beamwidth = safe_int(get(["beamwidth_deg", "beamwidth", "horizontal_beamwidth", "hbw"]))
+    tx_power = safe_float(get(["tx_power_dbm", "tx_power", "tx power", "power_dbm"]))
+
+    errors: list[str] = []
+    if not cell_id:
+        errors.append("cell_id is required")
+    if lat is None:
+        errors.append("lat is required")
+    elif not (-90.0 <= lat <= 90.0):
+        errors.append(f"lat {lat} out of range -90..90")
+    if lng is None:
+        errors.append("lng is required")
+    elif not (-180.0 <= lng <= 180.0):
+        errors.append(f"lng {lng} out of range -180..180")
+    if azimuth is None:
+        errors.append("azimuth is required")
+    elif not (0 <= azimuth <= 359):
+        errors.append(f"azimuth {azimuth} out of range 0..359")
+    if height_m is not None and not (0.0 <= height_m <= 200.0):
+        errors.append(f"height_m {height_m} out of range 0..200")
+    if mech_tilt is not None and not (-10.0 <= mech_tilt <= 30.0):
+        errors.append(f"mech_tilt {mech_tilt} out of range -10..30")
+    if elec_tilt is not None and not (-10.0 <= elec_tilt <= 30.0):
+        errors.append(f"elec_tilt {elec_tilt} out of range -10..30")
+    if ant_gain is not None and not (0.0 <= ant_gain <= 25.0):
+        errors.append(f"antenna_gain_dbi {ant_gain} out of range 0..25")
+    if beamwidth is not None and not (30 <= beamwidth <= 360):
+        errors.append(f"beamwidth_deg {beamwidth} out of range 30..360")
+    if tx_power is not None and not (0.0 <= tx_power <= 60.0):
+        errors.append(f"tx_power_dbm {tx_power} out of range 0..60")
+
+    return {
+        "row_num": row_idx,
+        "cell_id": cell_id or "",
+        "lat": lat, "lng": lng,
+        "site_name": site_name,
+        "height_m": height_m,
+        "azimuth": azimuth,
+        "mech_tilt": mech_tilt,
+        "elec_tilt": elec_tilt,
+        "antenna_model": ant_model,
+        "antenna_gain_dbi": ant_gain,
+        "beamwidth_deg": beamwidth,
+        "tx_power_dbm": tx_power,
+        "valid": len(errors) == 0,
+        "error_msg": "; ".join(errors) if errors else None,
+        "extra_data": {},
+    }
