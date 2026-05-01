@@ -260,3 +260,217 @@ def create_app(
         }
 
 
+    @app.get("/api/overview/kpis")
+    async def overview_kpis() -> dict:
+        cache: NetworkCache | None = app.state.network_cache
+        if cache is None:
+            return _empty_kpis_response("config not loaded")
+
+        snap = await asyncio.to_thread(cache.get)
+
+        def _build() -> dict:
+            k = compute_kpis(snap.network)
+            recent = compute_recent_decisions(runs_dir, limit=10_000)
+            k["pending_decisions"] = recent["pending_total"]
+            return k
+
+        kpis = await asyncio.to_thread(_build)
+
+        if app.state.influx_writer is not None:
+            def _record() -> None:
+                try:
+                    app.state.influx_writer.record_kpis(kpis)
+                    by_tech = kpis.get("by_technology") or {}
+                    if isinstance(by_tech, dict):
+                        app.state.influx_writer.record_conflict_summary(by_tech)
+                except Exception:
+                    pass
+            import threading
+            threading.Thread(target=_record, name="influx-record-kpis", daemon=True).start()
+
+        return {
+            "data": kpis,
+            "stale": cache.is_stale(snap),
+            "fetched_at": snap.wallclock_at,
+            "error": snap.last_error,
+            "data_unavailable": snap.network is None,
+        }
+
+    @app.get("/api/overview/trend")
+    def overview_trend(
+        metric: str = "active_conflicts",
+        hours: float = 24.0,
+        max_samples: int = 200,
+    ) -> dict:
+        if metric not in S.TREND_METRICS:
+            return {
+                "data": {"points": [], "metric": metric, "hours": hours},
+                "stale": True,
+                "fetched_at": time.time(),
+                "error": f"unknown metric: {metric}",
+            }
+        if app.state.influx_reader is None:
+            return {
+                "data": {"points": [], "metric": metric, "hours": hours},
+                "stale": True,
+                "fetched_at": time.time(),
+                "error": "influxdb is unreachable — trend history unavailable",
+            }
+        hours = max(0.1, min(hours, 168.0))
+        max_samples = max(2, min(max_samples, 1000))
+        points, err = app.state.influx_reader.query_trend(
+            metric, hours=hours, max_samples=max_samples,
+        )
+        return {
+            "data": {
+                "points": points,
+                "metric": metric,
+                "hours": hours,
+                "max_samples": max_samples,
+            },
+            "stale": err is not None,
+            "fetched_at": time.time(),
+            "error": err,
+        }
+
+    @app.get("/api/overview/recent-decisions")
+    def overview_recent_decisions(limit: int = 10) -> dict:
+        limit = max(1, min(limit, 200))
+        recent = compute_recent_decisions(runs_dir, limit=limit)
+        return {
+            "data": recent,
+            "stale": False,
+            "fetched_at": time.time(),
+            "error": None,
+        }
+
+    @app.get("/api/conflicts")
+    async def conflicts(
+        severity: str | None = None,
+        type: str | None = None,
+        technology: str | None = None,
+        search: str | None = None,
+        page: int = 1,
+        page_size: int = 50,
+    ) -> dict:
+        cache: NetworkCache | None = app.state.network_cache
+        if cache is None:
+            return {
+                "data": list_conflicts(None, app.state.config) if app.state.config else
+                        {"items": [], "total": 0, "page": page, "page_size": page_size,
+                         "summary": {"critical": 0, "major": 0, "minor": 0,
+                                      "by_class": {}, "by_technology": {}}},
+                "stale": True, "fetched_at": 0.0,
+                "error": app.state.config_error or "config not loaded",
+                "data_unavailable": True,
+            }
+        snap = await asyncio.to_thread(cache.get)
+        result = await asyncio.to_thread(
+            list_conflicts, snap.network, app.state.config,
+            severity=severity, type_filter=type, technology=technology,
+            search=search, page=page, page_size=page_size,
+        )
+        return {
+            "data": result,
+            "stale": cache.is_stale(snap),
+            "fetched_at": snap.wallclock_at,
+            "error": snap.last_error,
+            "data_unavailable": snap.network is None,
+        }
+
+
+    @app.get("/api/decisions")
+    def decisions_list(limit: int = 50, status: str | None = None) -> dict:
+        limit = max(1, min(limit, 500))
+        items = []
+        for path in list_run_files(runs_dir):
+            run = load_run(path)
+            if run is None:
+                continue
+            if status and run.get("status") != status:
+                continue
+            rid = run.get("run_id") or path.stem
+            items.append({
+                "run_id": rid,
+                "technology": run.get("technology"),
+                "generated_at": run.get("generated_at"),
+                "status": run.get("status", "pending"),
+                "applied_at": run.get("applied_at"),
+                "n_changes": len(run.get("changes", [])),
+                "n_cells": run.get("n_cells", 0),
+                "passes_executed": run.get("passes_executed", 0),
+                "converged": run.get("converged", False),
+                "final_soft_cost": run.get("final_soft_cost", 0.0),
+                "error": run.get("error"),
+            })
+        items.sort(key=lambda it: it.get("generated_at") or "", reverse=True)
+        items = items[:limit]
+        return {
+            "data": {"items": items, "total": len(items)},
+            "stale": False, "fetched_at": time.time(), "error": None,
+        }
+
+    @app.get("/api/decisions/{run_id}")
+    def decisions_detail(run_id: str) -> dict:
+        path = runs_dir / f"{run_id}.json"
+        if not path.is_file():
+            raise HTTPException(status_code=404, detail=f"run not found: {run_id}")
+        run = load_run(path)
+        if run is None:
+            raise HTTPException(status_code=500, detail=f"run unreadable: {run_id}")
+        return {
+            "data": run,
+            "stale": False, "fetched_at": time.time(), "error": None,
+        }
+
+    @app.get("/api/decisions/{run_id}/changes/{cell_id}/trace")
+    def decisions_trace(run_id: str, cell_id: str) -> dict:
+        path = runs_dir / f"{run_id}.json"
+        if not path.is_file():
+            raise HTTPException(status_code=404, detail=f"run not found: {run_id}")
+        run = load_run(path)
+        if run is None:
+            raise HTTPException(status_code=500, detail=f"run unreadable: {run_id}")
+        change = next(
+            (c for c in run.get("changes", []) if c.get("cell_id") == cell_id),
+            None,
+        )
+        if change is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"change for cell {cell_id} not in run {run_id}",
+            )
+        score_columns = ["mod3_penalty", "mod_aux_penalty", "mod30_penalty",
+                          "neg_max_distance", "pci_value"]
+        old_key = change.get("sort_key_old", []) or []
+        new_key = change.get("sort_key_new", []) or []
+        evaluation_matrix = []
+        for i, col in enumerate(score_columns):
+            evaluation_matrix.append({
+                "metric": col,
+                "before": old_key[i] if i < len(old_key) else None,
+                "after":  new_key[i] if i < len(new_key) else None,
+            })
+        return {
+            "data": {
+                "run_id": run.get("run_id"),
+                "technology": change.get("technology"),
+                "cell_id": change.get("cell_id"),
+                "mo_class": change.get("mo_class"),
+                "pci_old": change.get("pci_old"),
+                "pci_new": change.get("pci_new"),
+                "pci_components_new": change.get("pci_components_new"),
+                "reason_code": change.get("reason_code"),
+                "reason_text": change.get("reason_text"),
+                "pass_number": change.get("pass_number"),
+                "locked_neighborhood": change.get("locked_neighborhood", []),
+                "predicted_ho_failures_avoided_per_week":
+                    change.get("predicted_ho_failures_avoided_per_week"),
+                "evaluation_matrix": evaluation_matrix,
+                "generated_at": run.get("generated_at"),
+                "status": change.get("status", "pending"),
+                "config_snapshot": run.get("config_snapshot", {}),
+            },
+            "stale": False, "fetched_at": time.time(), "error": None,
+        }
+
