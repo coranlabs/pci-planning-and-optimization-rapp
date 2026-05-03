@@ -474,3 +474,227 @@ def create_app(
             "stale": False, "fetched_at": time.time(), "error": None,
         }
 
+    @app.get("/api/kpi/impact")
+    def kpi_impact(run_id: str | None = None) -> dict:
+        runs: list[dict] = []
+        if run_id:
+            path = runs_dir / f"{run_id}.json"
+            if not path.is_file():
+                raise HTTPException(status_code=404, detail=f"run not found: {run_id}")
+            r = load_run(path)
+            if r is not None:
+                runs.append(r)
+        else:
+            for path in list_run_files(runs_dir)[:50]:
+                r = load_run(path)
+                if r is not None:
+                    runs.append(r)
+
+        rows = []
+        total_predicted = 0.0
+        for r in runs:
+            rid = r.get("run_id")
+            for c in r.get("changes", []):
+                pred = c.get("predicted_ho_failures_avoided_per_week", 0.0) or 0.0
+                total_predicted += pred
+                rows.append({
+                    "run_id": rid,
+                    "technology": r.get("technology"),
+                    "cell_id": c.get("cell_id"),
+                    "decision_id": (rid or "") + "::" + (c.get("cell_id") or ""),
+                    "pci_old": c.get("pci_old"),
+                    "pci_new": c.get("pci_new"),
+                    "reason_code": c.get("reason_code"),
+                    "predicted_ho_failures_avoided_per_week": pred,
+                    "status": c.get("status", "pending"),
+                    "applied_at": r.get("applied_at"),
+                    "generated_at": r.get("generated_at"),
+                })
+
+        rows.sort(key=lambda x: -(x["predicted_ho_failures_avoided_per_week"] or 0.0))
+
+        predicted_by_tech = {"lte": 0.0, "nr": 0.0}
+        for row in rows:
+            t = (row.get("technology") or "").lower()
+            if t in predicted_by_tech:
+                predicted_by_tech[t] += float(row.get("predicted_ho_failures_avoided_per_week") or 0.0)
+
+        observed_failures = {"lte": 0, "nr": 0}
+        observed_attempts = {"lte": 0, "nr": 0}
+        cache_local: NetworkCache | None = app.state.network_cache
+        if cache_local is not None:
+            snap = cache_local.get()
+            if snap.network is not None:
+                cells = snap.network.cells
+                seen: set = set()
+                for r in snap.network.relations:
+                    src_cell = cells.get(r.source_cell_id)
+                    if src_cell is None:
+                        continue
+                    tech_key = src_cell.technology.value
+                    if tech_key not in observed_failures:
+                        continue
+                    a, b = sorted([r.source_cell_id, r.target_cell_id])
+                    key = (tech_key, a, b)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    fwd = snap.network.relation(r.source_cell_id, r.target_cell_id)
+                    rev = snap.network.relation(r.target_cell_id, r.source_cell_id)
+                    pair_failures = (fwd.ho_failures if fwd else 0) + (rev.ho_failures if rev else 0)
+                    pair_attempts = (fwd.ho_attempts if fwd else 0) + (rev.ho_attempts if rev else 0)
+                    observed_failures[tech_key] += pair_failures
+                    observed_attempts[tech_key] += pair_attempts
+
+        def _pct(predicted: float, observed: int) -> float | None:
+            if not observed:
+                return None
+            return min(1.0, predicted / observed)
+
+        per_tech_summary = {
+            t: {
+                "predicted_avoided": round(predicted_by_tech[t], 1),
+                "observed_failures": int(observed_failures[t]),
+                "observed_attempts": int(observed_attempts[t]),
+                "pct_failures_eliminated": _pct(predicted_by_tech[t], observed_failures[t]),
+            }
+            for t in ("lte", "nr")
+        }
+        total_observed_failures = sum(observed_failures.values())
+        total_pct_eliminated = _pct(total_predicted, total_observed_failures)
+
+        return {
+            "data": {
+                "items": rows,
+                "total": len(rows),
+                "total_predicted_ho_failures_avoided_per_week": round(total_predicted, 1),
+                "by_technology": per_tech_summary,
+                "total_observed_failures_in_pm_window": total_observed_failures,
+                "total_pct_failures_eliminated": total_pct_eliminated,
+            },
+            "stale": False, "fetched_at": time.time(), "error": None,
+        }
+
+    @app.post("/api/optimize/run")
+    async def optimize_run(technology: str | None = None) -> dict:
+        cache: NetworkCache | None = app.state.network_cache
+        if cache is None or app.state.config is None:
+            raise HTTPException(status_code=503, detail="config not loaded")
+        snap = await asyncio.to_thread(cache.get)
+        if snap.network is None:
+            raise HTTPException(
+                status_code=503,
+                detail=f"No network data: {snap.last_error or 'unknown error'}",
+            )
+        techs = ["lte", "nr"] if not technology else [technology.lower()]
+        written = await asyncio.to_thread(
+            trigger_optimization, runs_dir, snap.network, app.state.config, techs,
+        )
+        if app.state.influx_writer is not None:
+            for run_dict in written:
+                app.state.influx_writer.record_optimization_run(run_dict)
+        return {
+            "ok": True,
+            "runs": [{"run_id": w.get("run_id"),
+                       "technology": w.get("technology"),
+                       "n_changes": len(w.get("changes", [])),
+                       "status": w.get("status")} for w in written],
+        }
+
+
+    @app.get("/api/debug/network")
+    async def debug_network(limit: int = 20) -> dict:
+        cache: NetworkCache | None = app.state.network_cache
+        if cache is None:
+            return {"data": {"cells": [], "relations": []}, "error": "config not loaded"}
+        snap = await asyncio.to_thread(cache.get)
+        if snap.network is None:
+            return {"data": {"cells": [], "relations": []},
+                    "error": snap.last_error or "no network"}
+        cells = list(snap.network.cells.values())[:max(1, min(limit, 200))]
+        rels = list(snap.network.relations)[:max(1, min(limit, 200))]
+        return {
+            "data": {
+                "cells": [{
+                    "id": c.id, "technology": c.technology.value, "mo_class": c.mo_class,
+                    "pci": c.pci, "pci_components": c.pci_components, "duplex": c.duplex,
+                    "earfcn_dl": c.earfcn_dl, "arfcn_dl": c.arfcn_dl,
+                    "cell_type": c.cell_type, "tac": c.tac,
+                    "ho_attempts_total": c.ho_attempts_total,
+                    "ho_successes_total": c.ho_successes_total,
+                } for c in cells],
+                "relations": [{
+                    "source_cell_id": r.source_cell_id, "target_cell_id": r.target_cell_id,
+                    "ho_attempts": r.ho_attempts, "ho_successes": r.ho_successes,
+                    "ho_failures": r.ho_failures, "is_x2_xn": r.is_x2_xn,
+                    "relation_source": r.relation_source.value,
+                } for r in rels],
+                "totals": {
+                    "cells": len(snap.network.cells),
+                    "relations": len(snap.network.relations),
+                    "fetched_at": snap.wallclock_at,
+                },
+            },
+            "fetched_at": snap.wallclock_at,
+            "error": snap.last_error,
+        }
+
+    @app.get("/api/pipeline/stages")
+    async def pipeline_stages() -> dict:
+        cache: NetworkCache | None = app.state.network_cache
+        snap = await asyncio.to_thread(cache.get) if cache else None
+        net = snap.network if snap else None
+        runs_present = bool(list_run_files(runs_dir))
+        config_loaded = app.state.config is not None
+
+        def stage(name: str, label: str, status: str, note: str, count: int | None = None) -> dict:
+            return {"name": name, "label": label, "status": status,
+                    "note": note, "count": count}
+
+        stages = [
+            stage("kafka_in", "Kafka In",
+                  "ok" if net is not None else "down",
+                  "PM counters via bounded Kafka consumer"
+                  if net is not None else
+                  (snap.last_error if snap and snap.last_error else "no fetch yet"),
+                  count=(len(net.relations) if net else 0)),
+            stage("decode", "Decode",
+                  "ok" if net is not None else "idle",
+                  "PM XML parsed; topology + PM merged",
+                  count=(len(net.cells) if net else 0)),
+            stage("enrich", "Enrich",
+                  "ok" if net is not None else "idle",
+                  "Cells joined to relations and per-cell PM totals",
+                  count=(len(net.cells) if net else 0)),
+            stage("detect", "Detect",
+                  "ok" if net is not None else "idle",
+                  "Conflict graph G² built lazily by /api/conflicts",
+                  count=None),
+            stage("decide", "Decide",
+                  "ok" if runs_present else ("idle" if net else "down"),
+                  "Conservative graph coloring runs persisted to runs/",
+                  count=len(list_run_files(runs_dir))),
+        ]
+        return {
+            "data": {"stages": stages, "config_loaded": config_loaded},
+            "stale": cache.is_stale(snap) if cache and snap else True,
+            "fetched_at": snap.wallclock_at if snap else 0.0,
+            "error": (snap.last_error if snap else app.state.config_error),
+        }
+
+    @app.get("/api/config")
+    def config_get() -> dict:
+        if app.state.config is None:
+            return {
+                "data": None,
+                "stale": False,
+                "fetched_at": time.time(),
+                "error": app.state.config_error,
+            }
+        return {
+            "data": app.state.config.model_dump(),
+            "stale": False,
+            "fetched_at": time.time(),
+            "error": None,
+        }
+
