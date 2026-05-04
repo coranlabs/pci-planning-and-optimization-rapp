@@ -1014,3 +1014,164 @@ def create_app(
             "changes": len(built["changes"]),
         }
 
+    @app.post("/api/plan/upload")
+    async def plan_upload(
+        file: UploadFile = File(...),
+    ) -> dict:
+        if not file.filename:
+            raise HTTPException(status_code=400, detail="No file provided")
+        ext = file.filename.rsplit(".", 1)[-1].lower() if "." in file.filename else ""
+        if ext not in {"xlsx", "xls"}:
+            raise HTTPException(
+                status_code=400, detail="Invalid file type. Use .xlsx or .xls",
+            )
+        if app.state.config is None:
+            raise HTTPException(status_code=503, detail="Config not loaded")
+
+        raw = await file.read()
+        parsed = await asyncio.to_thread(plan_mod.parse_plan, raw)
+        if "error" in parsed:
+            return {"ok": False, **parsed}
+
+        network = parsed.pop("network")
+        built = await asyncio.to_thread(
+            plan_mod.build_plan, network, app.state.config,
+        )
+        plan_id = app.state.plan_store.add(file.filename, built)
+        _dash().add_audit({
+            "event_type": "plan_import",
+            "description": f"Cell plan \"{file.filename}\" imported: {parsed['rows']} rows, "
+                           f"{built['before']['summary']['total']} conflicts before, "
+                           f"{built['after']['summary']['total']} after, "
+                           f"{len(built['changes'])} PCI change(s) proposed",
+        })
+        return {
+            "ok": True,
+            "plan_id": plan_id,
+            "rows": parsed["rows"],
+            "invalid_count": parsed.get("invalid_count", 0),
+            "invalid_rows": parsed.get("invalid_rows", []),
+            "dangling_neighbors": parsed.get("dangling_neighbors", 0),
+            "before": built["before"]["summary"],
+            "after": built["after"]["summary"],
+            "changes": len(built["changes"]),
+        }
+
+    @app.post("/api/excel/upload")
+    async def excel_upload(
+        file: UploadFile = File(...),
+        description: str = Form(""),
+    ) -> dict:
+        if not file.filename:
+            raise HTTPException(status_code=400, detail="No file provided")
+        ext = file.filename.rsplit(".", 1)[-1].lower() if "." in file.filename else ""
+        if ext not in {"xlsx", "xls", "csv"}:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid file type. Use .xlsx, .xls, or .csv",
+            )
+        raw = await file.read()
+        result = await asyncio.to_thread(
+            _dash().excel_upload, file.filename, raw, description,
+        )
+        if "error" in result and not result.get("ok"):
+            return JSONResponse(status_code=400, content=result)
+        return result
+
+    @app.get("/api/excel/uploads")
+    async def excel_uploads() -> list:
+        return await asyncio.to_thread(_dash().excel_uploads)
+
+    @app.get("/api/excel/uploads/{upload_id}/records")
+    async def excel_records(
+        upload_id: int, page: int = 1, per_page: int = 50,
+        errors: str = "false",
+    ) -> dict:
+        result = await asyncio.to_thread(
+            _dash().excel_records, upload_id,
+            page=page, per_page=per_page,
+            errors_only=(errors.lower() == "true"),
+        )
+        if result is None:
+            raise HTTPException(status_code=404, detail="upload not found")
+        return result
+
+    @app.post("/api/excel/uploads/{upload_id}/apply")
+    async def excel_apply(upload_id: int) -> dict:
+        result = await asyncio.to_thread(_dash().excel_apply, upload_id)
+        if result is None:
+            raise HTTPException(status_code=404, detail="upload not found")
+        if not result.get("ok") and "only available" in (result.get("error") or ""):
+            return JSONResponse(status_code=503, content=result)
+        return result
+
+    @app.delete("/api/excel/uploads/{upload_id}")
+    async def excel_delete(upload_id: int) -> dict:
+        ok = await asyncio.to_thread(_dash().excel_delete, upload_id)
+        if not ok:
+            raise HTTPException(status_code=404, detail="upload not found")
+        return {"ok": True}
+
+
+    @app.get("/api/overview")
+    async def compat_overview() -> dict:
+        snap = await asyncio.to_thread(_dash().snapshot)
+        return {
+            "ranslice": None,
+            "analytics": None,
+            "cells": snap.get("CELLS", []),
+            "alerts": snap.get("ALERTS", []),
+            "poll_time": snap.get("meta", {}).get("updated"),
+            "poll_error": snap.get("meta", {}).get("poll_error"),
+        }
+
+    @app.get("/api/cells")
+    async def compat_cells() -> dict:
+        snap = await asyncio.to_thread(_dash().snapshot)
+        return {"cells": snap.get("CELLS", []), "alerts": snap.get("ALERTS", [])}
+
+    static_dir = ui_dir / "static"
+    if static_dir.is_dir():
+        app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
+
+    if ui_dir.is_dir():
+        app.mount("/ui", StaticFiles(directory=str(ui_dir), html=True), name="ui")
+
+    @app.middleware("http")
+    async def _no_cache_for_ui(request, call_next):
+        response = await call_next(request)
+        path = request.url.path
+        if (
+            path.startswith("/ui/")
+            or path.startswith("/static/")
+            or path == "/"
+            or path.startswith("/api/")
+        ):
+            response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+            response.headers["Pragma"] = "no-cache"
+            response.headers["Expires"] = "0"
+        return response
+
+    return app
+
+
+def _empty_kpis_response(reason: str) -> dict:
+    return {
+        "data": compute_kpis(None),
+        "stale": True,
+        "fetched_at": 0.0,
+        "error": reason,
+        "data_unavailable": True,
+    }
+
+
+_app: FastAPI | None = None
+
+
+def __getattr__(name: str) -> Any:
+    if name == "app":
+        global _app
+        if _app is None:
+            _app = create_app()
+        return _app
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
