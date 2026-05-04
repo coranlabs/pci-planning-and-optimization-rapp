@@ -698,3 +698,319 @@ def create_app(
             "error": None,
         }
 
+    @app.put("/api/config")
+    def config_put(payload: dict) -> dict:
+        try:
+            from pci_planning_and_optimization.app_config import AppConfig
+            new_cfg = AppConfig.model_validate(payload)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"validation failed: {e}") from e
+
+        import yaml
+        tmp = config_path.with_suffix(".tmp.yaml")
+        try:
+            with tmp.open("w", encoding="utf-8") as f:
+                yaml.safe_dump(new_cfg.model_dump(), f, sort_keys=False)
+            os.replace(tmp, config_path)
+        except OSError as e:
+            raise HTTPException(status_code=500, detail=f"write failed: {e}") from e
+        finally:
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except OSError:
+                pass
+
+        if app.state.influx_writer is not None:
+            try: app.state.influx_writer.close()
+            except Exception: pass
+        if app.state.influx_reader is not None:
+            try: app.state.influx_reader.close()
+            except Exception: pass
+
+        app.state.config = new_cfg
+        app.state.config_error = None
+        app.state.influx_writer = InfluxWriter(cfg=new_cfg.influxdb)
+        app.state.influx_reader = InfluxReader(cfg=new_cfg.influxdb)
+        app.state.network_cache = NetworkCache(config=new_cfg, ttl_seconds=30.0)
+        app.state.network_cache.influx_writer = app.state.influx_writer
+        return {
+            "ok": True,
+            "data": new_cfg.model_dump(),
+            "fetched_at": time.time(),
+        }
+
+    @app.get("/api/topology/cells")
+    async def topology_cells(limit: int = 5000) -> dict:
+        cache: NetworkCache | None = app.state.network_cache
+        if cache is None:
+            return {"data": {"cells": [], "total": 0,
+                              "has_coordinates": False, "synthesized": True,
+                              "center": {"lat": 53.3500, "lon": -6.4200}},
+                    "stale": True, "fetched_at": 0.0,
+                    "error": app.state.config_error or "config not loaded",
+                    "data_unavailable": True}
+        snap = await asyncio.to_thread(cache.get)
+        cells_out: list[dict] = []
+        any_real_coords = False
+        any_synthesized = False
+
+        if snap.network is not None:
+            sev_by_cell: dict[str, str] = {}
+            try:
+                conflicts = list_conflicts(snap.network, app.state.config, page_size=10_000)
+                for row in conflicts.get("items", []):
+                    rank = {"critical": 0, "major": 1, "minor": 2}
+                    cur = sev_by_cell.get(row["cell_a_id"])
+                    if cur is None or rank[row["severity"]] < rank[cur]:
+                        sev_by_cell[row["cell_a_id"]] = row["severity"]
+                    cur = sev_by_cell.get(row["cell_b_id"])
+                    if cur is None or rank[row["severity"]] < rank[cur]:
+                        sev_by_cell[row["cell_b_id"]] = row["severity"]
+            except Exception as e:
+                _log.warning("conflict severity index build failed: %s", e)
+
+            for c in list(snap.network.cells.values())[:max(1, min(limit, 50_000))]:
+                if c.lat is not None and c.lon is not None:
+                    lat, lon = c.lat, c.lon
+                    synthesized = False
+                    any_real_coords = True
+                else:
+                    lat, lon = synthesize_coords(c.id)
+                    synthesized = True
+                    any_synthesized = True
+                row = {
+                    "id": c.id,
+                    "technology": c.technology.value,
+                    "mo_class": c.mo_class,
+                    "pci": c.pci,
+                    "cell_type": c.cell_type,
+                    "lat": lat,
+                    "lon": lon,
+                    "coords_synthesized": synthesized,
+                    "frequency": c.primary_frequency(),
+                    "ho_attempts_total": c.ho_attempts_total,
+                    "ho_successes_total": c.ho_successes_total,
+                    "severity": sev_by_cell.get(c.id),
+                }
+                cells_out.append(row)
+
+        return {
+            "data": {
+                "cells": cells_out,
+                "total": len(snap.network.cells) if snap.network else 0,
+                "has_coordinates": True,
+                "any_real_coordinates": any_real_coords,
+                "any_synthesized": any_synthesized,
+                "center": {"lat": 53.3500, "lon": -6.4200},
+            },
+            "stale": cache.is_stale(snap),
+            "fetched_at": snap.wallclock_at,
+            "error": snap.last_error,
+            "data_unavailable": snap.network is None,
+        }
+
+
+    @app.post("/api/network/refresh")
+    async def network_refresh() -> dict:
+        cache: NetworkCache | None = app.state.network_cache
+        if cache is None:
+            raise HTTPException(
+                status_code=503,
+                detail=f"config not loaded: {app.state.config_error}",
+            )
+        snap = await asyncio.to_thread(cache.get, force_refresh=True)
+        return {
+            "ok": snap.network is not None and snap.last_error is None,
+            "fetched_at": snap.wallclock_at,
+            "cells": len(snap.network.cells) if snap.network else 0,
+            "relations": len(snap.network.relations) if snap.network else 0,
+            "error": snap.last_error,
+        }
+
+
+    def _dash() -> DashboardData:
+        return app.state.dashboard
+
+    @app.get("/api/dashboard/state")
+    async def dashboard_state(
+        tech: str | None = None, ts: str | None = None,
+    ) -> dict:
+        return await asyncio.to_thread(_dash().snapshot, tech, ts)
+
+
+    @app.post("/api/replan/propose")
+    async def replan_propose(payload: dict) -> dict:
+        cell_id = (payload or {}).get("cell_id")
+        if not cell_id:
+            raise HTTPException(status_code=400, detail="cell_id required")
+        result = await asyncio.to_thread(_dash().replan_propose, cell_id)
+        if not result.get("ok") and "only available" in (result.get("error") or ""):
+            return JSONResponse(status_code=503, content=result)
+        return result
+
+    @app.post("/api/replan/commit")
+    async def replan_commit(payload: dict) -> dict:
+        body = payload or {}
+        cell_id = body.get("cell_id")
+        proposed_pci = body.get("proposed_pci")
+        if not cell_id or proposed_pci is None:
+            raise HTTPException(
+                status_code=400, detail="cell_id and proposed_pci required",
+            )
+        result = await asyncio.to_thread(_dash().replan_commit, cell_id, proposed_pci)
+        if not result.get("ok") and "only available" in (result.get("error") or ""):
+            return JSONResponse(status_code=503, content=result)
+        return result
+
+
+    @app.get("/api/audit")
+    async def audit_get(
+        page: int = 1,
+        per_page: int = 50,
+        severity: str | None = None,
+        type: str | None = None,
+        search: str | None = None,
+    ) -> dict:
+        return await asyncio.to_thread(
+            _dash().get_audit,
+            page=page, per_page=per_page,
+            severity=severity, event_type=type, search=search,
+        )
+
+    @app.post("/api/audit")
+    async def audit_add(payload: dict) -> dict:
+        await asyncio.to_thread(_dash().add_audit, payload or {})
+        return {"ok": True}
+
+    @app.get("/api/audit/stats")
+    async def audit_stats() -> dict:
+        return await asyncio.to_thread(_dash().audit_stats)
+
+
+    @app.get("/api/settings")
+    async def settings_get() -> dict:
+        return await asyncio.to_thread(_dash().get_settings)
+
+    @app.post("/api/settings")
+    async def settings_set(payload: dict) -> dict:
+        await asyncio.to_thread(_dash().set_settings, payload or {})
+        return {"ok": True}
+
+    @app.get("/api/excel/template")
+    async def excel_template(tech: str | None = None) -> Response:
+        data = await asyncio.to_thread(_dash().excel_template_bytes, tech)
+        from datetime import datetime as _dt
+        stamp = _dt.utcnow().strftime("%Y%m%d-%H%M")
+        tech_norm = (tech or "").lower()
+        if tech_norm in ("lte", "4g"):
+            fname = f"cell-plan-lte-{stamp}.xlsx"
+        elif tech_norm in ("nr", "5g"):
+            fname = f"cell-plan-5g-{stamp}.xlsx"
+        else:
+            fname = f"site-config-template-{stamp}.xlsx"
+        return Response(
+            content=data,
+            media_type=(
+                "application/vnd.openxmlformats-officedocument."
+                "spreadsheetml.sheet"
+            ),
+            headers={"Content-Disposition": f"attachment; filename={fname}"},
+        )
+
+    @app.get("/api/excel/full-pool")
+    async def excel_full_pool(tech: str | None = None) -> Response:
+        data = await asyncio.to_thread(_dash().full_pool_bytes, tech)
+        from datetime import datetime as _dt
+        stamp = _dt.utcnow().strftime("%Y%m%d-%H%M")
+        tech_norm = (tech or "5g").lower()
+        fname = (
+            f"pci-pool-lte-{stamp}.xlsx"
+            if tech_norm in ("lte", "4g")
+            else f"pci-pool-5g-{stamp}.xlsx"
+        )
+        return Response(
+            content=data,
+            media_type=(
+                "application/vnd.openxmlformats-officedocument."
+                "spreadsheetml.sheet"
+            ),
+            headers={"Content-Disposition": f"attachment; filename={fname}"},
+        )
+
+
+    @app.get("/api/plan/template")
+    async def plan_template() -> Response:
+        data = await asyncio.to_thread(plan_mod.plan_template_bytes)
+        return Response(
+            content=data,
+            media_type=(
+                "application/vnd.openxmlformats-officedocument."
+                "spreadsheetml.sheet"
+            ),
+            headers={"Content-Disposition": "attachment; filename=pci-plan-template.xlsx"},
+        )
+
+    @app.get("/api/plan")
+    async def plan_list() -> list:
+        return app.state.plan_store.list()
+
+    @app.get("/api/plan/samples")
+    async def plan_samples() -> list:
+        cache: NetworkCache | None = app.state.network_cache
+        snap = await asyncio.to_thread(cache.get) if cache else None
+        return plan_mod.sample_plans(snap.network if snap else None)
+
+    @app.get("/api/plan/{plan_id}")
+    async def plan_get(plan_id: int) -> dict:
+        p = app.state.plan_store.get(plan_id)
+        if p is None:
+            raise HTTPException(status_code=404, detail="Unknown plan id")
+        return p
+
+    @app.get("/api/plan/{plan_id}/export")
+    async def plan_export(plan_id: int) -> Response:
+        p = app.state.plan_store.get(plan_id)
+        if p is None:
+            raise HTTPException(status_code=404, detail="Unknown plan id")
+        rows = app.state.plan_store.export_rows(plan_id)
+        data = await asyncio.to_thread(
+            plan_mod.plan_workbook_bytes, rows, plan_mod.EXPORT_HEADERS,
+        )
+        stem = re.sub(r"[^A-Za-z0-9._-]+", "-",
+                      p["filename"].rsplit(".", 1)[0]).strip("-") or "plan"
+        return Response(
+            content=data,
+            media_type=(
+                "application/vnd.openxmlformats-officedocument."
+                "spreadsheetml.sheet"
+            ),
+            headers={
+                "Content-Disposition": f"attachment; filename={stem}-optimised.xlsx",
+            },
+        )
+
+    @app.post("/api/plan/samples/{region}")
+    async def plan_sample_import(region: str) -> dict:
+        cache: NetworkCache | None = app.state.network_cache
+        snap = await asyncio.to_thread(cache.get) if cache else None
+        if snap is None or snap.network is None:
+            raise HTTPException(status_code=503, detail="No network data ingested yet")
+        network = plan_mod.network_to_plan(snap.network, region)
+        if not network.cells:
+            raise HTTPException(status_code=404, detail=f"No cells in region {region!r}")
+        built = await asyncio.to_thread(
+            plan_mod.build_plan, network, app.state.config,
+        )
+        plan_id = app.state.plan_store.add(f"{region} (sample)", built)
+        _dash().add_audit({
+            "event_type": "plan_import",
+            "description": f"Sample plan imported for {region}: {built['cell_count']} cells, "
+                           f"{len(built['changes'])} PCI change(s) proposed",
+        })
+        return {
+            "ok": True, "plan_id": plan_id, "rows": built["cell_count"],
+            "before": built["before"]["summary"], "after": built["after"]["summary"],
+            "changes": len(built["changes"]),
+        }
+
