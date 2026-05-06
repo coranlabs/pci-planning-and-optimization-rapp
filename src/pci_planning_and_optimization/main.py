@@ -115,3 +115,78 @@ class Orchestrator:
         self.health_manager.set_startup_ready()
         self.logger.debug("[STARTUP] All infra ready")
 
+    async def stop(self) -> None:
+        self.logger.debug("[SHUTDOWN] Stopping orchestrator")
+        self.health_manager.set_shutdown_mode()
+
+        while self._extra_cleanup:
+            cleanup = self._extra_cleanup.pop()
+            with suppress(Exception):
+                await cleanup()
+
+        if self._uvicorn_server is not None:
+            self._uvicorn_server.should_exit = True
+        if self._dashboard_task is not None:
+            with suppress(asyncio.CancelledError, Exception):
+                await asyncio.wait_for(self._dashboard_task, timeout=10)
+
+        self.logger.debug("[SHUTDOWN] Orchestrator stopped")
+
+    def add_cleanup(self, coro_factory: Callable[[], Awaitable[None]]) -> None:
+        self._extra_cleanup.append(coro_factory)
+
+    def request_shutdown(self) -> None:
+        self.shutdown_event.set()
+
+    def _mount_infra_routes(self) -> None:
+        probe_router = health_mod.health_router(self.health_manager)
+        self.fastapi_app.include_router(probe_router)
+        self.fastapi_app.include_router(
+            metrics_prom.metrics_router(registry=self.registry)
+        )
+
+    async def _run_dashboard_server(self) -> None:
+        cfg = uvicorn.Config(
+            app=self.fastapi_app,
+            host=self.host,
+            port=self.port,
+            log_level=self.config.log_level.lower(),
+            access_log=False,
+            log_config=None,
+        )
+        self._uvicorn_server = uvicorn.Server(cfg)
+        await self._uvicorn_server.serve()
+
+    def _install_signal_handlers(self) -> None:
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            with suppress(NotImplementedError, RuntimeError):
+                loop.add_signal_handler(sig, self.request_shutdown)
+
+
+async def _async_main(rapp_main: RAppMain | None = None) -> None:
+    async with Orchestrator() as orch:
+        if rapp_main is not None:
+            user_task = asyncio.create_task(rapp_main(orch), name="rapp-main")
+            try:
+                await orch.shutdown_event.wait()
+            finally:
+                if not user_task.done():
+                    user_task.cancel()
+                    with suppress(asyncio.CancelledError, Exception):
+                        await user_task
+        else:
+            orch.logger.warn(
+                "[STARTUP] No rApp main coroutine registered; orchestrator "
+                "will idle until SIGTERM. Pass rapp_main=callable to run() "
+                "to plug the new rApp's main loop in."
+            )
+            await orch.shutdown_event.wait()
+
+
+def run(rapp_main: RAppMain | None = None) -> None:
+    asyncio.run(_async_main(rapp_main))
+
+
+if __name__ == "__main__":
+    run()
