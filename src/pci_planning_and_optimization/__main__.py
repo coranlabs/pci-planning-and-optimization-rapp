@@ -316,3 +316,208 @@ def detect(
     sys.exit(0)
 
 
+@cli.command()
+@click.option(
+    "--output", "output_file",
+    type=click.Path(dir_okay=False),
+    default="runs/recommendations.json", show_default=True,
+)
+@click.option(
+    "--max-changes",
+    type=int, default=None,
+    help="Override per-run change budget (default from config.convergence).",
+)
+@click.pass_context
+def optimize(
+    ctx: click.Context,
+    output_file: str,
+    max_changes: int | None,
+) -> None:
+    from pci_planning_and_optimization.algorithm.coloring import run_optimization
+    from pci_planning_and_optimization.algorithm.conflict_graph import prepare_network
+    from pci_planning_and_optimization.models import Technology
+
+    cfg = _load_cfg(ctx)
+    technology_filter = ctx.obj["technology"]
+    log = logging.getLogger("pci_planning_and_optimization.optimize")
+
+    network = _load_network(ctx)
+    log.info("loaded %d cells, %d directed relations", len(network.cells), len(network.relations))
+
+    prepare_network(network, cfg)
+
+    techs_to_run: list[Technology]
+    if technology_filter == "all":
+        techs_to_run = [Technology.LTE, Technology.NR]
+    elif technology_filter == "lte":
+        techs_to_run = [Technology.LTE]
+    else:
+        techs_to_run = [Technology.NR]
+
+    payload: dict[str, object] = {
+        "input": _pm_dir(ctx),
+        "config": ctx.obj["config_path"],
+        "technology_filter": technology_filter,
+        "max_changes_override": max_changes,
+        "results": {},
+    }
+    any_run = False
+
+    for tech in techs_to_run:
+        tech_log = with_tech(log, tech.value)
+        n_cells_tech = sum(
+            1 for c in network.cells.values() if c.technology == tech
+        )
+        if n_cells_tech == 0:
+            tech_log.warning("no cells of this technology — skipping")
+            payload["results"][tech.value] = {
+                "skipped": True,
+                "reason": f"No cells of technology={tech.value} in input",
+            }
+            continue
+
+        run = run_optimization(
+            network, tech, cfg, max_changes_override=max_changes,
+        )
+        any_run = True
+
+        n_collisions = sum(
+            1 for c in run.changes if c.reason_code == "PCI_COLLISION_RESOLUTION"
+        )
+        n_confusions = sum(
+            1 for c in run.changes if c.reason_code == "PCI_CONFUSION_RESOLUTION"
+        )
+        n_modn = sum(
+            1 for c in run.changes if c.reason_code == "MODN_INTERFERENCE_REDUCTION"
+        )
+        total_predicted = sum(
+            c.predicted_ho_failures_avoided_per_week for c in run.changes
+        )
+        click.echo(
+            f"[{tech.value.upper()}] cells={run.n_cells}  "
+            f"changes={len(run.changes)} "
+            f"(collision={n_collisions}, confusion={n_confusions}, modN={n_modn})  "
+            f"passes={run.passes_executed} "
+            f"converged={run.converged}  "
+            f"final_soft_cost={run.final_soft_cost:.3f}  "
+            f"predicted_ho_avoided≈{total_predicted:.0f}/wk"
+        )
+
+        tech_log.info(
+            "completed: %d changes across %d passes (converged=%s, final_soft_cost=%.3f)",
+            len(run.changes), run.passes_executed,
+            run.converged, run.final_soft_cost,
+        )
+
+        payload["results"][tech.value] = run.to_dict()
+
+    out_path = Path(output_file)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, sort_keys=False)
+        f.write("\n")
+    log.info("wrote %s", out_path)
+
+    if not any_run:
+        sys.exit(2)
+    sys.exit(0)
+
+
+@cli.command()
+@click.option(
+    "--recommendations", "rec_file",
+    type=click.Path(exists=True, dir_okay=False),
+    required=True,
+)
+@click.option(
+    "--output", "output_file",
+    type=click.Path(dir_okay=False),
+    default="runs/dashboard.md", show_default=True,
+)
+@click.pass_context
+def validate(
+    ctx: click.Context,
+    rec_file: str,
+    output_file: str,
+) -> None:
+    from pci_planning_and_optimization.algorithm.conflict_graph import prepare_network
+    from pci_planning_and_optimization.models import Technology
+    from pci_planning_and_optimization.validation.ho_metrics import compute_ho_validation
+    from pci_planning_and_optimization.validation.reporter import render_dashboard_markdown
+
+    cfg = _load_cfg(ctx)
+    technology_filter = ctx.obj["technology"]
+    log = logging.getLogger("pci_planning_and_optimization.validate")
+
+    network = _load_network(ctx)
+    log.info(
+        "loaded before network: %d cells, %d directed relations",
+        len(network.cells), len(network.relations),
+    )
+    prepare_network(network, cfg)
+
+    with open(rec_file, encoding="utf-8") as f:
+        recs_payload = json.load(f)
+    log.info("loaded recommendations from %s", rec_file)
+
+    techs_to_run: list[Technology]
+    if technology_filter == "all":
+        techs_to_run = [Technology.LTE, Technology.NR]
+    elif technology_filter == "lte":
+        techs_to_run = [Technology.LTE]
+    else:
+        techs_to_run = [Technology.NR]
+
+    reports: dict[str, object] = {}
+    recs_by_tech: dict[str, list[dict[str, object]]] = {}
+
+    for tech in techs_to_run:
+        tech_log = with_tech(log, tech.value)
+        block = (recs_payload.get("results") or {}).get(tech.value, {})
+        if isinstance(block, dict) and block.get("skipped"):
+            tech_log.info("technology marked skipped in recommendations: %s", block.get("reason"))
+            report = compute_ho_validation(
+                network, tech,
+                recommendations=[],
+                skipped=True,
+                skip_reason=block.get("reason", "skipped"),
+                enable_mod6_lte=(
+                    cfg.scoring.lte.enable_mod6 if tech == Technology.LTE else False
+                ),
+            )
+        else:
+            tech_recs = list(block.get("changes", []))
+            recs_by_tech[tech.value] = tech_recs
+            report = compute_ho_validation(
+                network, tech,
+                recommendations=tech_recs,
+                enable_mod6_lte=(
+                    cfg.scoring.lte.enable_mod6 if tech == Technology.LTE else False
+                ),
+            )
+        reports[tech.value] = report
+
+        b, a = report.before, report.after
+        click.echo(
+            f"[{tech.value.upper()}] cells={report.n_cells} "
+            f"recs={report.n_recommendations} ({report.churn_pct:.2f}%) "
+            f"collisions={b.n_collisions}->{a.n_collisions} "
+            f"confusions={b.n_confusions}->{a.n_confusions} "
+            f"mod3={b.n_mod3}->{a.n_mod3} "
+            f"mod30={b.n_mod30}->{a.n_mod30} "
+            f"predicted_ho_avoided≈{report.predicted_ho_failures_avoided_per_week:.0f}/wk"
+        )
+
+    md = render_dashboard_markdown(
+        {tech: reports[tech] for tech in reports},
+        recommendations_by_tech=recs_by_tech if recs_by_tech else None,
+    )
+
+    out_path = Path(output_file)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(md, encoding="utf-8")
+    log.info("wrote %s (%d bytes)", out_path, len(md))
+
+    sys.exit(0)
+
+
