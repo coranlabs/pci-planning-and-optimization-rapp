@@ -521,3 +521,244 @@ def validate(
     sys.exit(0)
 
 
+@cli.command()
+@click.option(
+    "--host",
+    default="0.0.0.0", show_default=True,
+    help="Host interface to bind. 127.0.0.1 for local-only.",
+)
+@click.option(
+    "--port",
+    default=8080, show_default=True, type=int,
+    help=(
+        "TCP port for the combined dashboard, probes and /metrics. The "
+        "orchestrator merges the rApp's FastAPI app with /healthz, "
+        "/readyz, /startupz and /metrics on this single port."
+    ),
+)
+@click.option(
+    "--ui-dir",
+    default=None, type=click.Path(),
+    help="Override the dashboard asset directory. Defaults to the bundled webui.",
+)
+@click.option(
+    "--runs-dir",
+    default=None, type=click.Path(),
+    help="Override OptimizationRun persistence directory. Defaults to <repo>/runs.",
+)
+@click.pass_context
+def serve(
+    ctx: click.Context,
+    host: str,
+    port: int,
+    ui_dir: str | None,
+    runs_dir: str | None,
+) -> None:
+    import asyncio
+    import os
+    import platform
+    import time
+    from pathlib import Path as _Path
+
+    from pci_planning_and_optimization import banner
+    from pci_planning_and_optimization.api.auth import admin_credential
+
+    log_level = ctx.obj.get("log_level", "INFO")
+    log_format = os.environ.get(LOG_FORMAT_ENV, "json").strip().lower()
+
+    banner.title(
+        "PCI Planning and Optimization",
+        __version__,
+        "O-RAN Non-RT-RIC rApp",
+        "Conservative Graph Coloring · LTE + 5G NR",
+    )
+
+    boot_started = time.monotonic()
+    banner.rule("BOOT")
+
+    from pci_planning_and_optimization.api import server as _server_module
+    from pci_planning_and_optimization.main import Orchestrator
+
+    fastapi_app = _server_module.create_app(
+        ui_dir=_Path(ui_dir) if ui_dir else None,
+        runs_dir=_Path(runs_dir) if runs_dir else None,
+        config_path=_Path(ctx.obj["config_path"]) if ctx.obj.get("config_path") else None,
+    )
+
+    def _influx_live() -> bool:
+        writer = getattr(fastapi_app.state, "influx_writer", None)
+        return bool(writer and writer.stats().get("enabled"))
+
+    def _kafka_ingest(cfg: AppConfig | None) -> bool:
+        return bool(cfg and not cfg.osc.pm_directory and cfg.osc.kafka.brokers)
+
+    def _print_boot() -> None:
+        state = fastapi_app.state
+        cfg: AppConfig | None = getattr(state, "config", None)
+        colour = "yes" if sys.stdout.isatty() else "off (not a tty)"
+
+        banner.check(
+            True, "runtime",
+            f"python {platform.python_version()} · pid {os.getpid()} · "
+            f"{platform.system().lower()}-{platform.machine()}",
+        )
+        if cfg is None:
+            banner.check(False, "config", f"{state.config_path} · {state.config_error}")
+        else:
+            banner.check(
+                True, "config",
+                f"{state.config_path} · {len(type(cfg).model_fields)} sections · schema ok",
+            )
+            gaps = unfilled(cfg)
+            if gaps:
+                banner.check(
+                    False, "unconfigured",
+                    f"{state.config_path} needs to be configured · "
+                    f"{len(gaps)} value(s) still to be filled",
+                )
+                for gap in gaps:
+                    banner.check(False, "", gap)
+        banner.check(
+            True, "log level", f"{log_level} · format {log_format} · colour {colour}",
+        )
+        banner.check(True, "tracing", "in-process tracer · contextvar propagation")
+        banner.check(
+            True, "metrics", "prometheus registry · process_* python_* collectors",
+        )
+        banner.check(True, "probes", "/healthz  /readyz  /startupz  /metrics")
+        banner.check(
+            True, "middleware", "panic recovery · CORS · no-cache for UI assets",
+        )
+
+        operator, _ = admin_credential()
+        if operator:
+            banner.check(True, "auth", f"operator account '{operator}' configured")
+        else:
+            banner.check(
+                False, "auth",
+                "no operator account — set RAPP_ADMIN_USERNAME/RAPP_ADMIN_PASSWORD",
+            )
+
+        if cfg is None:
+            banner.check(False, "pm ingest", "config did not load — no data source")
+        elif cfg.osc.pm_directory:
+            banner.check(
+                True, "pm ingest",
+                f"3GPP TS 32.435 PM XML from {cfg.osc.pm_directory}",
+            )
+        elif cfg.osc.kafka.brokers:
+            banner.check(True, "pm ingest", f"topic {cfg.osc.kafka.topic}")
+            banner.check(
+                True, "kafka",
+                f"{cfg.osc.kafka.brokers} · {cfg.osc.kafka.security_protocol} · "
+                f"group {cfg.osc.kafka.group_id}",
+            )
+        else:
+            banner.check(False, "pm ingest", "no PM directory and no Kafka brokers")
+
+        if cfg is not None:
+            sftp = cfg.osc.sftp
+            banner.check(
+                sftp.enabled, "sftp pool",
+                f"max idle {sftp.max_idle_seconds:.0f}s · "
+                f"cleanup {sftp.cleanup_interval_seconds:.0f}s · "
+                f"timeout {sftp.timeout_seconds:.0f}s"
+                if sftp.enabled else "disabled — PM files are read from disk only",
+            )
+            sdnr = cfg.sdnr
+            banner.check(
+                sdnr.enabled, "sdnr",
+                f"{sdnr.base_url} · node {sdnr.netconf_node_id or 'unset'}"
+                if sdnr.enabled else "disabled — recommendations are not written back",
+            )
+            banner.check(
+                _influx_live(), "influxdb",
+                f"{cfg.influxdb.url} · bucket {cfg.influxdb.bucket}"
+                if _influx_live() else "not configured — time-series disabled",
+            )
+        banner.check(True, "http server", f"uvicorn · {host}:{port}")
+        banner.check(True, "signals", "SIGINT · SIGTERM → graceful shutdown")
+        banner.blank()
+
+        base = f"http://{host}:{port}"
+        mode = (
+            "closed-loop · SDNR apply armed"
+            if cfg is not None and cfg.sdnr.enabled
+            else "recommend-only · operator approval required"
+        )
+        banner.box(
+            "READY",
+            [
+                ("Dashboard", f"{base}/ui/index.html"),
+                ("API docs", f"{base}/docs"),
+                ("Probes", "/healthz   /readyz   /startupz"),
+                ("Metrics", "/metrics"),
+                ("Mode", mode),
+            ],
+            f"booted in {(time.monotonic() - boot_started) * 1000:.0f}ms",
+        )
+        banner.blank()
+        banner.rule("RUNTIME")
+
+    def _uptime(seconds: float) -> str:
+        hours, rest = divmod(int(seconds), 3600)
+        minutes, secs = divmod(rest, 60)
+        if hours:
+            return f"{hours}h {minutes:02d}m {secs:02d}s"
+        if minutes:
+            return f"{minutes}m {secs:02d}s"
+        return f"{seconds:.2f}s"
+
+    async def _serve() -> None:
+        started = time.monotonic()
+        async with Orchestrator(fastapi_app=fastapi_app, host=host, port=port) as orch:
+            _print_boot()
+            await orch.shutdown_event.wait()
+            uptime = time.monotonic() - started
+            teardown = time.monotonic()
+            cfg: AppConfig | None = getattr(fastapi_app.state, "config", None)
+            cleanups = len(orch._extra_cleanup)
+
+            banner.blank()
+            banner.rule("SHUTDOWN")
+            banner.arrow("signal", "shutdown requested — draining subsystems")
+            banner.check(True, "readiness", "probes now report shutting-down")
+            if _kafka_ingest(cfg):
+                banner.check(
+                    True, "pm ingest", "consumer stopped · partitions released",
+                )
+            banner.check(
+                bool(cleanups), "cleanups",
+                f"{cleanups} registered hook(s) drained" if cleanups
+                else "none registered",
+            )
+
+        writer = getattr(fastapi_app.state, "influx_writer", None)
+        stats = writer.stats() if writer is not None else {}
+        banner.check(True, "http server", "in-flight requests drained · listener closed")
+        banner.check(
+            bool(stats.get("enabled")), "influxdb",
+            f"{stats.get('writes_ok', 0)} points written · writer closed"
+            if stats.get("enabled") else "was not running",
+        )
+        banner.blank()
+        banner.box(
+            "STOPPED",
+            [
+                ("Uptime", _uptime(uptime)),
+                ("Teardown", f"{time.monotonic() - teardown:.2f}s"),
+                ("Exit", "clean — every subsystem released"),
+            ],
+            f"pci-planning-and-optimization v{__version__}",
+        )
+        banner.blank()
+
+    asyncio.run(_serve())
+
+
+def main() -> None:
+    cli(obj={})
+
+
+if __name__ == "__main__":
+    main()
