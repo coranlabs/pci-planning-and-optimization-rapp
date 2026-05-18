@@ -154,3 +154,50 @@ limitations under the License.
     <p class="footer">PCI Planning and Optimization rApp __APP_VERSION__ &middot; &copy; 2026 coRAN Labs</p>
   </div>
 
+<script>
+  (function () {
+    var form = document.getElementById('login-form');
+    var alertBox = document.getElementById('alert');
+    var submit = document.getElementById('submit');
+    var username = document.getElementById('username');
+    var password = document.getElementById('password');
+
+    document.getElementById('toggle-pw').addEventListener('click', function () {
+      var hidden = password.type === 'password';
+      password.type = hidden ? 'text' : 'password';
+      this.textContent = hidden ? 'Hide' : 'Show';
+      password.focus();
+    });
+
+    function fail(message) {
+      alertBox.textContent = message;
+      alertBox.classList.add('visible');
+      password.setAttribute('aria-invalid', 'true');
+      submit.disabled = false;
+      submit.textContent = 'Sign in';
+    }
+
+    form.addEventListener('submit', function (e) {
+      e.preventDefault();
+      alertBox.classList.remove('visible');
+      password.removeAttribute('aria-invalid');
+      submit.disabled = true;
+      submit.textContent = 'Signing in…';
+
+      fetch(form.action, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: username.value, password: password.value })
+      }).then(function (r) {
+        return r.json().catch(function () { return {}; }).then(function (body) {
+          if (r.ok && body.ok) { window.location.replace('/'); return; }
+          fail(body.error || 'Sign-in failed (HTTP ' + r.status + '). Try again.');
+        });
+      }).catch(function () {
+        fail('Could not reach the server. Check your connection and try again.');
+      });
+    });
+  })();
+</script>
+</body>
+</html>
