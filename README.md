@@ -194,3 +194,56 @@ variables relax them, and the component logs a warning at startup when they do:
 points the pool at a different file. Report a vulnerability to
 **support@coranlabs.com** rather than opening a public issue.
 
+## Endpoints
+
+| Path | Purpose |
+| --- | --- |
+| `/` `/login` | Dashboard and sign-in |
+| `/api/overview/...` `/api/cells` `/api/conflicts` | KPIs, trend, cells and live conflicts |
+| `/api/decisions/...` | Optimization runs, their changes and per-change traces |
+| `/api/plan/...` `/api/excel/...` | Cell plan import, optimisation and export |
+| `/api/replan/propose` `/api/replan/commit` | Operator approval and the PCI write |
+| `/api/audit` `/api/audit/stats` | Audit trail |
+| `/api/topology/cells` | Cell coordinates and neighbours for the map |
+| `/api/config` `/api/settings` `/api/pipeline/stages` | Runtime config and pipeline state |
+| `/healthz` `/readyz` `/startupz` `/metrics` | Probes and Prometheus |
+
+## Build and run
+
+Requires Python 3.12. The package manager is [uv](https://github.com/astral-sh/uv).
+
+```bash
+uv sync
+uv run pci-planning-and-optimization serve   # dashboard, probes and /metrics on :8080
+
+# read PM XML off disk instead of Kafka
+PM_DIRECTORY=/path/to/pm/xml uv run pci-planning-and-optimization serve
+```
+
+`PM_DIRECTORY` runs the same parser and the same adapter as the deployed path, so
+it exercises the same code; only the transport differs. It is what to use for
+offline replay and for bringing up the dashboard without a RAN attached.
+
+The batch phases run the same pipeline one stage at a time and write JSON and
+markdown into `runs/`:
+
+```bash
+uv run pci-planning-and-optimization --pm-dir /path/to/pm/xml hypothesis   # correlation gate
+uv run pci-planning-and-optimization --pm-dir /path/to/pm/xml detect       # conflict detection
+uv run pci-planning-and-optimization --pm-dir /path/to/pm/xml optimize     # recommendations
+uv run pci-planning-and-optimization --pm-dir /path/to/pm/xml validate \
+    --recommendations runs/recommendations.json                            # before/after
+```
+
+`--technology lte|nr|all` filters any of them. The write path is the dashboard's
+approval flow, not the CLI.
+
+To deploy onto an SMO over R1, see [Build_guide.md](Build_guide.md). The Helm
+chart is in `deploy/helm/pci-planning-rapp` with InfluxDB as a dependency, and
+`rapp-package/` holds the ASD, the ACM composition and the SME service APIs.
+`scripts/create-csar.sh` packages the two into the CSAR that rApp Manager
+onboards.
+
+## License
+
+Apache 2.0. See [LICENSE](LICENSE). Third-party components are listed in [NOTICE](NOTICE).
