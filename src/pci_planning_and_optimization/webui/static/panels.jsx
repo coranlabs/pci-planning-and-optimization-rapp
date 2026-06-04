@@ -359,3 +359,417 @@ function computePulse(cells, conflicts) {
   };
 }
 
+function niceScale(v) {
+  const p = Math.pow(10, Math.floor(Math.log10(Math.max(v, 1e-9))));
+  const m = v / p;
+  const [mant, ticks] = [[1, 4], [1.25, 5], [1.5, 3], [2, 4], [2.5, 5], [3, 3], [4, 4], [5, 5], [6, 3], [8, 4], [10, 5]]
+    .find(([k]) => m <= k) || [10, 5];
+  return { max: mant * p, ticks };
+}
+
+const ConflictTrend = ({ history }) => {
+  const [hover, setHover] = React.useState(null);
+  const { points, summary } = React.useMemo(() => buildConflictHistory(history), [history]);
+  if (points.length < 2) {
+    return (
+      <div className="kpi-hero-trend" style={{ justifyContent: 'flex-end' }}>
+        <div className="kht-title"><span>Conflict trend</span></div>
+        <div style={{ fontSize: 12.5, color: 'var(--fg-3)' }}>
+          Sampled once a minute while the dashboard runs — the trend line appears after the second sample.
+        </div>
+      </div>
+    );
+  }
+
+  const W = 640, H = 150, padL = 4, padR = 4, padT = 8, padB = 4;
+  const innerW = W - padL - padR, innerH = H - padT - padB;
+  const yMax = niceScale(Math.max(...points.map(p => p.total)) * 1.08).max;
+  const x = (i) => padL + (i / (points.length - 1)) * innerW;
+  const y = (v) => padT + innerH - (v / yMax) * innerH;
+
+
+  const bands = [
+    ['modn',      'var(--info)', 'Mod-3'],
+    ['confusion', 'var(--warn)', 'Confusion'],
+    ['collision', 'var(--crit)', 'Collision'],
+  ];
+  let base = points.map(() => 0);
+  const shapes = bands.map(([key, color, label]) => {
+    const top = points.map((p, i) => base[i] + p[key]);
+    const fwd = top.map((v, i) => `${x(i).toFixed(1)},${y(v).toFixed(1)}`);
+    const back = base.map((v, i) => `${x(i).toFixed(1)},${y(v).toFixed(1)}`).reverse();
+    const shape = { key, color, label, area: [...fwd, ...back].join(' '), line: fwd.join(' ') };
+    base = top;
+    return shape;
+  });
+
+  const ticks = [yMax / 2, yMax];
+  const onMove = (e) => {
+    const r = e.currentTarget.getBoundingClientRect();
+    const ratio = Math.max(0, Math.min(1, (e.clientX - r.left) / r.width));
+    const idx = Math.round(ratio * (points.length - 1));
+    setHover({ idx, pctX: (x(idx) / W) * 100, point: points[idx] });
+  };
+
+  return (
+    <div className="kpi-hero-trend" onMouseMove={onMove} onMouseLeave={() => setHover(null)}>
+      <div className="kht-title">
+        <span>Conflict trend · last {spanLabel(summary.spanMin)}</span>
+        <span className="kht-ticks">{ticks.map((v, i) => (
+          <span key={i} style={{ top: `${(y(v) / H) * 100}%` }}>{Number.isInteger(v) ? v : v.toFixed(1)}</span>
+        ))}</span>
+      </div>
+      <svg viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none">
+        {ticks.map((v, i) => (
+          <line key={i} x1={padL} x2={W - padR} y1={y(v)} y2={y(v)} className="grid-line" vectorEffect="non-scaling-stroke"/>
+        ))}
+        <line x1={padL} x2={W - padR} y1={y(0)} y2={y(0)} className="grid-line" vectorEffect="non-scaling-stroke"/>
+        {shapes.map(sh => (
+          <g key={sh.key}>
+            <polygon points={sh.area} fill={sh.color} opacity="0.16"/>
+            <polyline points={sh.line} fill="none" stroke={sh.color} strokeWidth="1.8" vectorEffect="non-scaling-stroke"/>
+          </g>
+        ))}
+        {hover && (
+          <line x1={x(hover.idx)} x2={x(hover.idx)} y1={padT} y2={padT + innerH}
+                stroke="var(--fg-3)" strokeDasharray="2 3" vectorEffect="non-scaling-stroke"/>
+        )}
+      </svg>
+      <div className="kht-x">
+        {points.map((p, i) => i % Math.max(1, Math.ceil(points.length / 5)) === 0 && i < points.length - 1 && (
+          <span key={i} style={{ left: `${(x(i) / W) * 100}%` }}>{p.label}</span>
+        ))}
+        <span style={{ left: `${(x(points.length - 1) / W) * 100}%` }}>now</span>
+      </div>
+      {hover && (
+        <div className="kht-tip" style={{ left: `${hover.pctX}%`, transform: hover.pctX > 60 ? 'translateX(calc(-100% - 10px))' : 'translateX(10px)' }}>
+          <div className="kht-tip-t">{hover.idx === points.length - 1 ? 'now' : hover.point.label} · <b>{hover.point.total}</b> total</div>
+          {[...bands].reverse().map(([key, color, label]) => (
+            <div key={key}><i style={{ background: color }}/>{label} <b>{hover.point[key]}</b></div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+};
+
+const KpiStrip = ({ onNavigate }) => {
+  const k = window.PCI_DATA.KPIS;
+  const conflicts = window.PCI_DATA.CONFLICTS || [];
+
+
+  const numberWord = (n) =>
+    ['Zero','One','Two','Three','Four','Five','Six','Seven','Eight','Nine','Ten'][n] || String(n);
+
+  const byType = {
+    collision: conflicts.filter(c => c.type === 'collision'),
+    confusion: conflicts.filter(c => c.type === 'confusion'),
+    mod3:      conflicts.filter(c => c.type === 'mod3'),
+  };
+  const bySev = (sev, list) => list.filter(c => c.severity === sev);
+
+
+  const phrases = [];
+  for (const [type, label] of [['collision', 'collision'], ['confusion', 'confusion'], ['mod3', 'mod-3 alignment']]) {
+    const list = byType[type];
+    if (list.length === 0) continue;
+
+    const sevOrder = ['critical', 'major', 'minor'];
+    const worst = sevOrder.find(s => bySev(s, list).length > 0) || list[0].severity;
+    const worstList = bySev(worst, list);
+    const c = worstList[0];
+    const count = list.length;
+    const head = `${count === 1 ? `${count} ${worst} ${label}` : `${numberWord(count).toLowerCase()} ${worst} ${label}s`}`;
+    let detail = '';
+    if (count === 1 && c.cells && c.cells.length >= 2 && typeof c.pci === 'number') {
+      detail = ` on PCI ${c.pci} (${c.cells[0]} ↔ ${c.cells[1]})`;
+    } else if (count === 1 && typeof c.pci === 'number') {
+      detail = ` on PCI ${c.pci}`;
+    }
+    phrases.push({ html: <><b>{head}</b>{detail}</>, type, count });
+  }
+
+
+  const heroDesc = (() => {
+    if (phrases.length === 0) {
+      return <>No PCI conflicts detected — the pool is clean and handover is stable.</>;
+    }
+    if (phrases.length === 1) {
+      const p = phrases[0];
+      const verb = p.count === 1 ? 'is' : 'are';
+      return <>{p.html} {verb} degrading handover.</>;
+    }
+
+    const lead = phrases.slice(0, 2);
+    const tail = phrases.slice(2);
+    return (
+      <>
+        {lead[0].html} and {lead[1].html} are degrading handover.
+        {tail.length > 0 && <> {tail.map((p, i) => <React.Fragment key={i}>{i > 0 && ', '}{p.html}</React.Fragment>)} {tail.length === 1 && tail[0].count === 1 ? 'is' : 'are'} queued for re-plan.</>}
+      </>
+    );
+  })();
+
+
+  const totalUeImpacted = conflicts.reduce((acc, c) => acc + (c.affectedUe || 0), 0);
+
+
+  const critMajor = conflicts.filter(c => c.severity === 'critical' || c.severity === 'major').length;
+
+  return (
+    <div className="kpi-editorial">
+      <div className="panel kpi-hero">
+        <div className="kpi-hero-head">
+          <span className="kpi-hero-eyebrow">
+            {conflicts.length === 0
+              ? '● All clear · pool stable'
+              : critMajor > 0
+                ? '● Critical · requires attention'
+                : '● Minor · informational'}
+          </span>
+          <h3 className="kpi-hero-title">PCI conflicts in pool</h3>
+        </div>
+        <div className="kpi-hero-body">
+          <div className="kpi-hero-num">
+            {k.pciConflicts}
+            <small>active conflict{k.pciConflicts === 1 ? '' : 's'} · {k.totalCells} cells in pool</small>
+          </div>
+          <p className="kpi-hero-desc">{heroDesc}</p>
+          <ConflictTrend history={window.PCI_DATA.HISTORY}/>
+        </div>
+        <div className="kpi-hero-foot">
+          {totalUeImpacted > 0 && (
+            <span className="kpi-hero-tag"><span style={{ width: 6, height: 6, borderRadius: '50%', background: 'var(--crit)' }}/>{totalUeImpacted.toLocaleString()} UEs impacted</span>
+          )}
+          {conflicts.length === 0 && (
+            <span className="kpi-hero-tag"><span style={{ width: 6, height: 6, borderRadius: '50%', background: 'var(--ok)' }}/>handover stable</span>
+          )}
+        </div>
+        <div className="kpi-hero-mix">
+          <div className="khm-row">
+            <span className="khm-key"><i style={{ background: 'var(--crit)' }}/>Collision</span>
+            <b>{byType.collision.length}</b>
+          </div>
+          <div className="khm-row">
+            <span className="khm-key"><i style={{ background: 'var(--warn)' }}/>Confusion</span>
+            <b>{byType.confusion.length}</b>
+          </div>
+          <div className="khm-row">
+            <span className="khm-key"><i style={{ background: 'var(--info)' }}/>Mod-3</span>
+            <b>{byType.mod3.length}</b>
+          </div>
+        </div>
+      </div>
+      <div className="panel pulse-panel">
+        <div className="pulse-head">
+          <div className="pulse-head-titles">
+            <h4>Network Pulse</h4>
+            <span className="pulse-head-sub">4 live metrics</span>
+          </div>
+          <span className="pulse-head-live"><span className="dot"/>Live</span>
+        </div>
+        <div className="pulse-rows">
+          {(() => {
+            const p = computePulse(
+              window.PCI_DATA.CELLS, window.PCI_DATA.CONFLICTS,
+            );
+            const totalCells = p.totalCells || 0;
+            const worst = p.worstRegion;
+            return (
+              <>
+                <KpiRow
+                  status="ok"
+                  label="Cells reporting"
+                  sub={(() => {
+                    const by = (window.PCI_DATA.meta || {}).cellsByTech || {};
+                    return `in the last PM ingest · ${by.lte ?? 0} LTE + ${by.nr ?? 0} NR in the feed`;
+                  })()}
+                  value={totalCells}
+                  unit={window.PCI_TECH === 'lte' ? '4G LTE' : '5G NR'}
+                  sparkColor="var(--ok)"
+                />
+                <KpiRow
+                  status="accent"
+                  label="Affected UEs"
+                  sub={`subscribers across ${p.conflictCount || 0} active conflict${(p.conflictCount || 0) === 1 ? '' : 's'}`}
+                  value={(p.affectedUes || 0).toLocaleString()}
+                  unit=""
+                  sparkColor="var(--accent)"
+                />
+                <KpiRow
+                  status={worst ? 'warn' : 'ok'}
+                  label="Worst-hit region"
+                  sub={worst
+                    ? `${worst.conflicts} conflict${worst.conflicts === 1 ? '' : 's'} · ${(worst.ues || 0).toLocaleString()} UEs at risk`
+                    : 'no conflicts — every region clean'}
+                  value={worst ? worst.name : '—'}
+                  unit=""
+                  sparkColor="var(--warn)"
+                  onClick={worst && onNavigate ? (() => {
+                    window.PCI_MAP_FOCUS = worst.name;
+                    onNavigate('cell-map');
+                  }) : undefined}
+                />
+                <KpiRow
+                  status={(p.mod3Cells || 0) > 0 ? 'info' : 'ok'}
+                  label="Mod-3 interference"
+                  sub="cells with reference-signal SINR degradation"
+                  value={p.mod3Cells || 0}
+                  unit={(p.mod3Cells || 0) === 1 ? 'cell' : 'cells'}
+                  sparkColor="var(--info)"
+                />
+              </>
+            );
+          })()}
+        </div>
+      </div>
+    </div>
+  );
+};
+
+
+const ThroughputChart = () => {
+  const ts = window.PCI_DATA.TS;
+  const [hover, setHover] = useState(null);
+
+  if (!ts || ts.length === 0) {
+    return (
+      <div className="chart-empty">
+        <Icon name="activity" size={20}/>
+        <div className="chart-empty-title">No throughput yet</div>
+        <div className="chart-empty-sub">
+          Nothing recorded in the last {(TS_RANGES.find(r => r[0] === window.PCI_TS_RANGE) || TS_RANGES[1])[2]} —
+          the series fills in as PM data for the selected technology is ingested.
+        </div>
+      </div>
+    );
+  }
+
+  const sliced = ts;
+
+  const W = 920, H = 280;
+  const padL = 44, padR = 50, padT = 18, padB = 28;
+  const innerW = W - padL - padR;
+  const innerH = H - padT - padB;
+
+  const dlMax = Math.max(...sliced.map(p => p.dl), 0);
+  const ulMax = Math.max(...sliced.map(p => p.ul), 0);
+
+
+  const gbps = Math.max(dlMax, ulMax) >= 2000;
+  const unitDiv = gbps ? 1000 : 1;
+  const unit = gbps ? 'Gbps' : 'Mbps';
+  const scale = niceScale(Math.max(dlMax, ulMax, 1) / unitDiv * 1.1);
+  const tpMax = scale.max * unitDiv;
+  const yTicks = scale.ticks;
+  const fmtTp = (v) => { const x = v / unitDiv; return Number.isInteger(x) ? String(x) : x.toFixed(1); };
+
+
+  const x = (i) => padL + (sliced.length > 1 ? (i / (sliced.length - 1)) * innerW : 0);
+  const yTp  = (v) => padT + innerH - (v / tpMax) * innerH;
+
+
+  const dlPts = sliced.map((p, i) => `${x(i).toFixed(1)},${yTp(p.dl).toFixed(1)}`).join(' ');
+  const ulPts = sliced.map((p, i) => `${x(i).toFixed(1)},${yTp(p.ul).toFixed(1)}`).join(' ');
+
+
+  const dlArea = `${padL},${padT + innerH} ${dlPts} ${(padL + innerW).toFixed(1)},${padT + innerH}`;
+
+  const tpTicks = Array.from({ length: yTicks + 1 }, (_, i) => (tpMax / yTicks) * i);
+
+
+  const spansDays = window.PCI_TS_RANGE === '7d';
+  const xLabelEvery = Math.ceil(sliced.length / (spansDays ? 6 : 8));
+  const fmt = (p, opts) => (p.iso && window.formatTime) ? window.formatTime(p.iso, opts) : p.t;
+  const tLabel = (p) => fmt(p, spansDays
+    ? { month: 'short', day: 'numeric', hour: undefined, minute: undefined }
+    : { month: undefined, day: undefined, hour: '2-digit', minute: '2-digit', hour12: false });
+  const hoverLabel = (p) => fmt(p, window.PCI_TS_RANGE === '15m' || window.PCI_TS_RANGE === '1h'
+    ? { month: undefined, day: undefined, hour: '2-digit', minute: '2-digit', hour12: false }
+    : { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false });
+
+  const onMove = (e) => {
+    const rect = e.currentTarget.getBoundingClientRect();
+    const px = ((e.clientX - rect.left) / rect.width) * W;
+    if (px < padL || px > padL + innerW) { setHover(null); return; }
+    const ratio = (px - padL) / innerW;
+    const idx = Math.round(ratio * (sliced.length - 1));
+    setHover({ idx, x: x(idx), point: sliced[idx] });
+  };
+
+
+  const pct = (v, axis, denom) => axis === 'x' ? ((v / (denom || innerW)) * 100) : (v / H) * 100;
+
+  return (
+    <div className="chart-wrap">
+      <svg className="chart-svg" viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none"
+        onMouseMove={onMove} onMouseLeave={() => setHover(null)}>
+        <defs>
+          <linearGradient id="dl-fill" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%"   stopColor="var(--accent)" stopOpacity="0.32" />
+            <stop offset="100%" stopColor="var(--accent)" stopOpacity="0" />
+          </linearGradient>
+        </defs>
+
+        {tpTicks.map((v, i) => {
+          const yy = yTp(v);
+          return (
+            <line key={'g' + i} x1={padL} x2={padL + innerW} y1={yy} y2={yy} className="grid-line" />
+          );
+        })}
+
+        <polygon points={dlArea} fill="url(#dl-fill)" />
+        <polyline points={dlPts} fill="none" stroke="var(--accent)" strokeWidth="1.6" vectorEffect="non-scaling-stroke" />
+        <polyline points={ulPts} fill="none" stroke="var(--maint)" strokeWidth="1.8" strokeDasharray="0" opacity="0.95" vectorEffect="non-scaling-stroke" />
+
+        {hover && (
+          <g>
+            <line x1={hover.x} x2={hover.x} y1={padT} y2={padT + innerH} stroke="var(--fg-3)" strokeDasharray="2 3" vectorEffect="non-scaling-stroke" />
+            <circle cx={hover.x} cy={yTp(hover.point.dl)}  r="3" fill="var(--accent)" />
+            <circle cx={hover.x} cy={yTp(hover.point.ul)}  r="3" fill="var(--maint)" />
+          </g>
+        )}
+      </svg>
+
+      <div className="chart-axis chart-axis-y-left">
+        <span className="axis-unit">{unit}</span>
+        {tpTicks.map((v, i) => (
+          <span key={'yl' + i} style={{ top: `${pct(yTp(v), 'y')}%` }}>{fmtTp(v)}</span>
+        ))}
+      </div>
+      <div className="chart-axis chart-axis-x">
+        {sliced.map((p, i) => i % xLabelEvery === 0 && (
+          <span key={'xl' + i} style={{ left: `${(x(i) / W) * 100}%` }}>{tLabel(p)}</span>
+        ))}
+      </div>
+
+      {hover && (
+        <div style={{
+          position: 'absolute',
+          left: `calc(${(hover.x / W) * 100}% + 12px)`,
+          top: 8,
+          background: 'var(--bg-3)',
+          border: '1px solid var(--line-2)',
+          borderRadius: 'var(--r-sm)',
+          padding: '8px 10px',
+          fontSize: 12,
+          fontFamily: 'var(--font-mono)',
+          color: 'var(--fg-2)',
+          pointerEvents: 'none',
+          minWidth: 140,
+          zIndex: 2,
+        }}>
+          <div style={{ color: 'var(--fg)', marginBottom: 4 }}>{hoverLabel(hover.point)}</div>
+          <div><span style={{ color: 'var(--accent)' }}>DL</span> {fmtTp(hover.point.dl)} {unit}</div>
+          <div><span style={{ color: 'var(--maint)' }}>UL</span> {fmtTp(hover.point.ul)} {unit}</div>
+        </div>
+      )}
+
+      <div className="chart-legend">
+        <div className="legend-item"><i className="legend-swatch" style={{ background: 'var(--accent)' }} /> DL Throughput</div>
+        <div className="legend-item"><i className="legend-swatch" style={{ background: 'var(--maint)' }} /> UL Throughput</div>
+      </div>
+    </div>
+  );
+};
+
