@@ -773,3 +773,542 @@ const ThroughputChart = () => {
   );
 };
 
+const TS_RANGES = [
+  ['15m', '15m', '15 min'],
+  ['1h',  '1h',  '60 min'],
+  ['6h',  '6h',  '6 hours'],
+  ['24h', '24h', '24 hours'],
+  ['7d',  '7d',  '7 days'],
+];
+
+const ChartPanel = () => {
+  const range = window.PCI_TS_RANGE;
+  const current = TS_RANGES.find(r => r[0] === range) || TS_RANGES[1];
+  return (
+    <div className="panel">
+      <div className="panel-head">
+        <div className="titles">
+          <h3 className="panel-title">Throughput</h3>
+          <div className="panel-sub">Aggregate DL/UL · last {current[2]}</div>
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <div className="seg sm">
+            {TS_RANGES.map(([k, short]) => (
+              <button key={k} data-on={range === k ? 1 : undefined}
+                onClick={() => window.setPciTsRange(k)}>{short}</button>
+            ))}
+          </div>
+          <FeedPill/>
+        </div>
+      </div>
+      <ThroughputChart/>
+    </div>
+  );
+};
+
+
+const FEED_STALE_AFTER_S = 180;
+
+function feedAgeLabel(sec) {
+  if (sec < 90) return `${Math.round(sec)}s`;
+  if (sec < 5400) return `${Math.round(sec / 60)}m`;
+  return `${(sec / 3600).toFixed(1)}h`;
+}
+
+function feedStatus() {
+  const meta = window.PCI_DATA.meta || {};
+  if (meta.poll_error) return { cls: 'pill stale', label: 'STALE', title: meta.poll_error };
+  if (!(window.PCI_DATA.CELLS || []).length) return { cls: 'pill idle', label: 'NO DATA', title: 'No PM data ingested yet' };
+  const age = meta.feed_age_seconds;
+  if (typeof age === 'number' && age > FEED_STALE_AFTER_S) {
+    return {
+      cls: 'pill stale',
+      label: `STALE · ${feedAgeLabel(age)}`,
+      title: `No PM file has arrived for ${feedAgeLabel(age)}. Figures below are the last received snapshot, not current network state.`,
+    };
+  }
+  const seen = (typeof age === 'number') ? ` · last PM ${feedAgeLabel(age)} ago` : '';
+  return { cls: 'pill live', label: 'LIVE', title: `Last update ${meta.updated ? window.formatTime(meta.updated) : ''}${seen} · polls every 30 s` };
+}
+const FeedPill = () => {
+  const f = feedStatus();
+  return <span className={f.cls} title={f.title}><span className="dot"/>{f.label}</span>;
+};
+
+window.alertTime = (a) => (a && a.iso && window.formatTime)
+  ? window.formatTime(a.iso, { month: undefined, day: undefined, hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false })
+  : (a ? a.t : '');
+
+const AlertsPanel = () => {
+  const [filter, setFilter] = useState('all');
+  const all = window.PCI_DATA.ALERTS;
+  const list = useMemo(() => {
+    if (filter === 'all') return all;
+    return all.filter(a => a.sev === filter);
+  }, [filter, all]);
+  const counts = useMemo(() => ({
+    all: all.length,
+    critical: all.filter(a => a.sev === 'critical').length,
+    major:    all.filter(a => a.sev === 'major').length,
+    minor:    all.filter(a => a.sev === 'minor').length,
+    info:     all.filter(a => a.sev === 'info').length,
+  }), [all]);
+
+  return (
+    <div className="panel" style={{ minHeight: 0 }}>
+      <div className="panel-head">
+        <div className="titles">
+          <h3 className="panel-title">Incident Feed</h3>
+          <div className="panel-sub">{counts.critical + counts.major} critical/major · {all.length} open</div>
+        </div>
+      </div>
+      <div className="seg" style={{ alignSelf: 'flex-start' }}>
+        {[
+          ['all', 'ALL · ' + counts.all],
+          ['critical', 'CRIT · ' + counts.critical],
+          ['major', 'MAJ · ' + counts.major],
+          ['minor', 'MIN · ' + counts.minor],
+        ].map(([k, label]) => (
+          <button key={k} data-on={filter === k ? 1 : 0} onClick={() => setFilter(k)}>{label}</button>
+        ))}
+      </div>
+      <div className="alerts-list" style={{ overflow: 'auto', maxHeight: 360 }}>
+        {list.map(a => (
+          <div key={a.id} className={`alert ${a.sev}`}>
+            <span className="bar" />
+            <div className="body">
+              <div className="top">
+                <span className="kind">{a.kind}</span>
+                <span className={`chip ${a.sev === 'critical' ? 'crit' : a.sev === 'major' ? 'warn' : a.sev === 'minor' ? 'info' : 'idle'}`}>
+                  <span className="dot"/>{a.sev}
+                </span>
+                <span className="cell">· {a.cell}</span>
+              </div>
+              <div className="msg">{a.msg}</div>
+            </div>
+            <span className="t">{window.alertTime(a)}</span>
+          </div>
+        ))}
+        {list.length === 0 && (
+          <div style={{ padding: 24, textAlign: 'center', color: 'var(--fg-3)', fontSize: 13 }}>
+            No alerts at this severity.
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
+
+
+const SPECTRUM_STATE_COLOR = {
+  collision: 'var(--crit)',
+  confusion: 'var(--warn)',
+  mod3: 'var(--info)',
+  used: 'var(--accent)',
+  free: 'var(--line-2)',
+};
+const SPECTRUM_STATE_LABEL = {
+  collision: 'Collision', confusion: 'Confusion', mod3: 'Mod-3 cluster',
+  used: 'In use', free: 'Unassigned',
+};
+
+const PciSpectrum = ({ cells, conflicts, poolSize, usedMap, collidedPCIs, confusedPCIs, reusedPCIs }) => {
+  const mod3Pcis = useMemo(() => {
+    const ids = new Set(conflicts.filter(c => c.type === 'mod3').flatMap(c => c.cells));
+    return new Set(cells.filter(c => ids.has(c.id)).map(c => c.pci));
+  }, [cells, conflicts]);
+
+
+  const stateOf = React.useCallback((pci) => {
+    if (collidedPCIs.has(pci)) return 'collision';
+    if (confusedPCIs.has(pci)) return 'confusion';
+    if (mod3Pcis.has(pci)) return 'mod3';
+    return usedMap.has(pci) ? 'used' : 'free';
+  }, [collidedPCIs, confusedPCIs, mod3Pcis, usedMap]);
+
+  const states = useMemo(
+    () => Array.from({ length: poolSize }, (_, i) => stateOf(i)),
+    [poolSize, stateOf]
+  );
+
+  const counts = useMemo(() => {
+    const c = { collision: 0, confusion: 0, mod3: 0, used: 0, free: 0 };
+    states.forEach(s => { c[s] += 1; });
+    return c;
+  }, [states]);
+
+  const [hover, setHover] = useState(null);
+
+
+  const largestGap = useMemo(() => {
+    let best = 0, run = 0, bestAt = 0, at = 0;
+    states.forEach((s, i) => {
+      if (s === 'free') { if (run === 0) at = i; run += 1; if (run > best) { best = run; bestAt = at; } }
+      else run = 0;
+    });
+    return { size: best, start: bestAt };
+  }, [states]);
+
+  const W = 1000, BAND_H = 54, LANE_H = 20, LANE_GAP = 5;
+  const colW = W / poolSize;
+
+  const bandRects = (list, y, h) => list.map(({ pci, state }) => (
+    <rect key={pci} x={pci * colW} y={y} width={Math.max(colW, 0.9)} height={h}
+      fill={SPECTRUM_STATE_COLOR[state]}
+      opacity={state === 'free' ? 0.35 : 1}/>
+  ));
+
+  const all = states.map((state, pci) => ({ pci, state }));
+  const lanes = [0, 1, 2].map(g => all.filter(d => d.pci % 3 === g));
+
+  const svgRef = React.useRef(null);
+  const onMove = (e) => {
+
+
+    const el = svgRef.current;
+    if (!el) return;
+    const r = el.getBoundingClientRect();
+    const pci = Math.max(0, Math.min(poolSize - 1,
+      Math.floor(((e.clientX - r.left) / r.width) * poolSize)));
+    const holders = (usedMap.get(pci) || []).map(c => c.id ?? c);
+    setHover({ pci, state: states[pci], holders, reuse: holders.length,
+               x: e.clientX - r.left, w: r.width });
+  };
+
+  const pct = Math.round(((poolSize - counts.free) / poolSize) * 100);
+
+  return (
+    <div className="spectrum">
+      <div className="spectrum-stats">
+        <div className="sp-stat">
+          <div className="sp-stat-k">Namespace in use</div>
+          <div className="sp-stat-v">{pct}<small>%</small></div>
+          <div className="sp-stat-h">{poolSize - counts.free} of {poolSize} PCIs</div>
+        </div>
+        <div className="sp-stat">
+          <div className="sp-stat-k">Largest free run</div>
+          <div className="sp-stat-v">{largestGap.size}</div>
+          <div className="sp-stat-h">from PCI {largestGap.start}</div>
+        </div>
+        <div className="sp-stat">
+          <div className="sp-stat-k">Mean reuse</div>
+          <div className="sp-stat-v">
+            {(() => {
+              const used = poolSize - counts.free;
+              return used ? (cells.length / used).toFixed(1) : '0';
+            })()}<small>×</small>
+          </div>
+          <div className="sp-stat-h">{(reusedPCIs || new Set()).size} PCIs held by 2+ cells</div>
+        </div>
+        <div className="sp-stat">
+          <div className="sp-stat-k">In conflict</div>
+          <div className="sp-stat-v tone-bad">{counts.collision + counts.confusion + counts.mod3}</div>
+          <div className="sp-stat-h">
+            {counts.collision} collision · {counts.confusion} confusion · {counts.mod3} mod-3
+          </div>
+        </div>
+      </div>
+
+      <div className="spectrum-band-wrap" onMouseMove={onMove} onMouseLeave={() => setHover(null)}>
+        <svg ref={svgRef} viewBox={`0 0 ${W} ${BAND_H + (LANE_H + LANE_GAP) * 3 + 26}`}
+             preserveAspectRatio="none" className="spectrum-svg">
+          {bandRects(all, 0, BAND_H)}
+          {lanes.map((lane, g) => (
+            <g key={g}>
+              {lane.map(({ pci, state }) => (
+                <rect key={pci} x={pci * colW} y={BAND_H + 12 + g * (LANE_H + LANE_GAP)}
+                  width={Math.max(colW, 0.9)} height={LANE_H}
+                  fill={SPECTRUM_STATE_COLOR[state]}
+                  opacity={state === 'free' ? 0.22 : 0.95}/>
+              ))}
+            </g>
+          ))}
+          {hover && (
+            <rect x={hover.pci * colW - 0.5} y={0} width={Math.max(colW, 1.5) + 1}
+              height={BAND_H + 12 + (LANE_H + LANE_GAP) * 3}
+              fill="none" stroke="var(--fg)" strokeWidth={1.5} vectorEffect="non-scaling-stroke"/>
+          )}
+        </svg>
+
+        <div className="spectrum-lane-labels">
+          <span style={{ top: BAND_H + 12 }}>mod-3 · 0</span>
+          <span style={{ top: BAND_H + 12 + (LANE_H + LANE_GAP) }}>mod-3 · 1</span>
+          <span style={{ top: BAND_H + 12 + (LANE_H + LANE_GAP) * 2 }}>mod-3 · 2</span>
+        </div>
+
+        {hover && (
+          <div className="spectrum-tip" style={{
+            left: `${62 + Math.min(Math.max(hover.x, 70), hover.w - 70)}px`,
+          }}>
+            <b>PCI {hover.pci}</b>
+            <span className="sp-tip-state" style={{ color: SPECTRUM_STATE_COLOR[hover.state] }}>
+              {SPECTRUM_STATE_LABEL[hover.state]}
+            </span>
+            {hover.reuse > 0 && (
+              <span className="sp-tip-cells">
+                reused by {hover.reuse} cell{hover.reuse === 1 ? '' : 's'}
+              </span>
+            )}
+            {hover.holders.length > 0 && (
+              <span className="sp-tip-cells">{hover.holders.slice(0, 2).join(', ')}
+                {hover.holders.length > 2 ? ` +${hover.holders.length - 2}` : ''}</span>
+            )}
+          </div>
+        )}
+      </div>
+
+      <div className="spectrum-axis">
+        {Array.from({ length: 9 }, (_, i) => Math.round((poolSize - 1) * (i / 8))).map(v => (
+          <span key={v}>{v}</span>
+        ))}
+      </div>
+
+      <div className="pool-legend">
+        {['free', 'used', 'mod3', 'confusion', 'collision'].map(k => (
+          <div key={k}><i style={{ background: SPECTRUM_STATE_COLOR[k] }}/>{SPECTRUM_STATE_LABEL[k]}</div>
+        ))}
+      </div>
+    </div>
+  );
+};
+
+
+const PciPoolPanel = ({ onSelectCell, tech }) => {
+  const cells = window.PCI_DATA.CELLS;
+  const conflicts = window.PCI_DATA.CONFLICTS;
+  const [view, setView] = useState('spectrum');
+
+
+  const poolSize = tech === 'lte' ? 504 : 1008;
+
+  const usedMap = useMemo(() => {
+    const m = new Map();
+    cells.forEach(c => {
+      if (!m.has(c.pci)) m.set(c.pci, []);
+      m.get(c.pci).push(c);
+    });
+    return m;
+  }, [cells]);
+
+
+  const collidedPCIs = useMemo(() => new Set(
+    conflicts.filter(c => c.type === 'collision' && typeof c.pci === 'number').map(c => c.pci)
+  ), [conflicts]);
+
+
+  const reusedPCIs = useMemo(() => new Set(
+    [...usedMap.entries()].filter(([_, arr]) => arr.length > 1).map(([k]) => k)
+  ), [usedMap]);
+
+  const confusedPCIs = useMemo(() => new Set(
+    conflicts.filter(c => c.type === 'confusion' && typeof c.pci === 'number').map(c => c.pci)
+  ), [conflicts]);
+
+  const mod3PCIs = useMemo(() => {
+    if (view !== 'mod3') return new Set();
+    const ids = conflicts.filter(c => c.type === 'mod3').flatMap(c => c.cells);
+    return new Set(cells.filter(c => ids.includes(c.id)).map(c => c.pci));
+  }, [view, cells, conflicts]);
+
+  const slots = [];
+  for (let i = 0; i < poolSize; i++) {
+    const arr = usedMap.get(i) || [];
+    let cls = 'pool-cell';
+    if (arr.length) cls += ' used';
+    if (collidedPCIs.has(i)) cls += ' collide';
+    if (confusedPCIs.has(i)) cls += ' confuse';
+    if (mod3PCIs.has(i))     cls += ' mod3';
+    slots.push(
+      <div key={i} className={cls} title={arr.length
+        ? `PCI ${i}\n${arr.map(c => c.id + ' (' + c.site + ')').join('\n')}`
+        : `PCI ${i} · unassigned`}
+        onClick={() => arr[0] && onSelectCell && onSelectCell(arr[0])}>
+        {arr.length > 0 && i}
+      </div>
+    );
+  }
+
+
+  const conflictRows = (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+      {conflicts.map(c => (
+        <div key={c.id} className="panel" style={{ padding: 12, gap: 8, border: '1px solid var(--line)', background: 'var(--bg-3)' }}>
+          <div className="row-h" style={{ justifyContent: 'space-between' }}>
+            <div className="row-h" style={{ gap: 10 }}>
+              <span className={`chip ${c.severity === 'critical' ? 'crit' : c.severity === 'major' ? 'warn' : 'info'}`}>
+                <span className="dot"/>{c.severity}
+              </span>
+              <span className="mono" style={{ color: 'var(--fg)', fontSize: 14 }}>{c.id}</span>
+              <span style={{ color: 'var(--fg-2)', fontSize: 13.5, textTransform: 'uppercase', letterSpacing: '0.04em', fontWeight: 500 }}>
+                {c.type}
+              </span>
+              <span className="mono" style={{ color: 'var(--fg-3)', fontSize: 12.5 }}>PCI {c.pci}</span>
+            </div>
+            <span className="mono" style={{ color: 'var(--fg-3)', fontSize: 12 }}>{
+              window.formatTime
+                ? window.formatTime(c.detected, { month: undefined, day: undefined,
+                    hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false })
+                : c.detected
+            }</span>
+          </div>
+          <div style={{ fontSize: 13.5, color: 'var(--fg-2)', lineHeight: 1.5 }}>{c.impact}</div>
+          <div className="row-h" style={{ gap: 10, fontSize: 12.5, color: 'var(--fg-3)' }}>
+            <span>cells:</span>
+            {c.cells.map(cid => (
+              <span key={cid} className="mono" style={{ color: 'var(--fg-2)', padding: '2px 8px', border: '1px solid var(--line-2)', borderRadius: 4 }}>{cid}</span>
+            ))}
+            <span style={{ marginLeft: 'auto', color: 'var(--fg-2)' }}>{c.affectedUe} UEs impacted</span>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+
+  return (
+    <div className="panel">
+      <div className="panel-head">
+        <div className="titles">
+          <h3 className="panel-title">PCI Pool · 0–{poolSize - 1}</h3>
+          <div className="panel-sub">
+            {usedMap.size} of {poolSize} PCIs in use ·{' '}
+            {collidedPCIs.size} PCI{collidedPCIs.size === 1 ? '' : 's'} in collision ·{' '}
+            {confusedPCIs.size} in confusion ·{' '}
+            {conflicts.filter(c => c.type === 'mod3').length} mod-3 pairs reported
+          </div>
+        </div>
+        <div className="row-h" style={{ gap: 10 }}>
+          <div className="seg">
+            {[['spectrum','SPECTRUM'],['pool','POOL'],['mod3','MOD-3'],['conflicts','CONFLICTS']].map(([k,l])=> (
+              <button key={k} data-on={view===k?1:0} onClick={()=>setView(k)}>{l}</button>
+            ))}
+          </div>
+          <button className="btn-sm" onClick={() => window.exportPciPoolCSV()}>
+            <Icon name="download" size={12}/> Export
+          </button>
+        </div>
+      </div>
+
+      {(view === 'pool' || view === 'mod3') && (
+        <>
+          <div className="pool-grid">{slots}</div>
+          <div className="pool-legend">
+            <div><i style={{ background: 'var(--bg-3)', boxShadow: 'inset 0 0 0 1px var(--line-2)' }}/>unassigned</div>
+            <div><i style={{ background: 'color-mix(in oklch, var(--accent) 60%, #ffffff)' }}/>in use</div>
+            {view === 'mod3' && <div><i style={{ background: '#8b5cf6' }}/>mod-3 aligned</div>}
+            <div><i style={{ background: '#f59e0b' }}/>confusion</div>
+            <div><i style={{ background: '#dc2626' }}/>collision</div>
+            <div className="pool-legend-note">
+              {view === 'mod3'
+                ? 'Tiles sharing a mod-3 residue with a same-frequency neighbour.'
+                : 'One tile per PCI in the namespace.'}
+            </div>
+          </div>
+        </>
+      )}
+      {view === 'spectrum' && (
+        <PciSpectrum
+          cells={cells} conflicts={conflicts} poolSize={poolSize}
+          usedMap={usedMap} collidedPCIs={collidedPCIs} confusedPCIs={confusedPCIs}
+          reusedPCIs={reusedPCIs}
+        />
+      )}
+      {view === 'conflicts' && conflictRows}
+    </div>
+  );
+};
+
+
+const CellTable = ({ onSelect, selectedId }) => {
+  const cells = window.PCI_DATA.CELLS;
+  const [sort, setSort] = useState({ key: 'id', dir: 1 });
+  const [q, setQ] = useState('');
+  const [statusFilter, setStatusFilter] = useState('active');
+
+  const filtered = useMemo(() => {
+    let r = cells;
+    if (q) r = r.filter(c => (c.id + ' ' + c.site + ' ' + c.region + ' ' + c.band + ' ' + c.pci).toLowerCase().includes(q.toLowerCase()));
+    if (statusFilter !== 'all') r = r.filter(c => c.status === statusFilter);
+    r = [...r].sort((a, b) => {
+      const av = a[sort.key], bv = b[sort.key];
+      if (typeof av === 'number') return (av - bv) * sort.dir;
+      return String(av).localeCompare(String(bv)) * sort.dir;
+    });
+    return r;
+  }, [cells, sort, q, statusFilter]);
+
+
+  const headers = [
+    ['id', 'CELL', 'l'], ['site', 'SITE', 'l'], ['region', 'REGION', 'l'], ['band', 'BAND', 'l'],
+    ['pci', 'PCI', 'r'], ['dl', 'DL Mbps', 'r'], ['ul', 'UL Mbps', 'r'], ['ue', 'UEs', 'r'],
+    ['sinr', 'SINR dB', 'r'], ['cqi', 'CQI', 'r'], ['bler', 'BLER %', 'r'], ['prb', 'PRB %', 'r'],
+  ];
+  const num = (v, d = 1) => (typeof v === 'number' ? v.toFixed(d) : '—');
+
+  const onHeaderClick = (k) => {
+    setSort(s => s.key === k ? { key: k, dir: -s.dir } : { key: k, dir: 1 });
+  };
+
+  return (
+    <div className="panel" style={{ overflow: 'hidden', padding: 0 }}>
+      <div className="panel-head" style={{ padding: 'var(--pad-panel)', paddingBottom: 12 }}>
+        <div className="titles">
+          <h3 className="panel-title">Cell Performance</h3>
+          <div className="panel-sub">{filtered.length} of {cells.length} cells · click row to drill in</div>
+        </div>
+      </div>
+      <div style={{ overflow: 'auto', maxHeight: 460 }}>
+        <table className="tbl">
+          <thead>
+            <tr>
+              {headers.map(([k, l, a]) => (
+                <th key={k} style={{ textAlign: a === 'r' ? 'right' : 'left', cursor: 'pointer' }}
+                    onClick={() => onHeaderClick(k)}>
+                  {l}{sort.key === k ? (sort.dir > 0 ? ' ↑' : ' ↓') : ''}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {filtered.map(c => {
+              const inConflict = window.PCI_DATA.CONFLICTS.some(cf => cf.cells.includes(c.id));
+              return (
+                <tr key={c.id} className={selectedId === c.id ? 'selected' : ''} onClick={() => onSelect && onSelect(c)}>
+                  <td className="id">{c.id}</td>
+                  <td>{c.site}</td>
+                  <td className="muted">{c.region}</td>
+                  <td className="muted">{c.band || '—'}</td>
+                  <td className="num">
+                    {inConflict ? <span style={{ color: 'var(--crit)', fontWeight: 600 }}>{c.pci} ⚠</span> : c.pci}
+                  </td>
+                  <td className="num">{num(c.dl)}</td>
+                  <td className="num">{num(c.ul)}</td>
+                  <td className="num">{typeof c.ue === 'number' ? c.ue : '—'}</td>
+                  <td className="num" style={{ color: typeof c.sinr === 'number' && c.sinr < 5 ? 'var(--warn)' : undefined }}>{num(c.sinr)}</td>
+                  <td className="num">{num(c.cqi)}</td>
+                  <td className="num" style={{ color: typeof c.bler === 'number' && c.bler > 5 ? 'var(--warn)' : undefined }}>{num(c.bler, 2)}</td>
+                  <td className="num">
+                    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                      <span style={{
+                        width: 36, height: 4, background: 'var(--bg-3)', borderRadius: 2,
+                        position: 'relative', overflow: 'hidden'
+                      }}>
+                        <span style={{
+                          position: 'absolute', inset: 0, width: c.prb + '%',
+                          background: c.prb > 75 ? 'var(--warn)' : 'var(--accent)',
+                          borderRadius: 2,
+                        }}/>
+                      </span>
+                      {c.prb}
+                    </span>
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+};
+
+
