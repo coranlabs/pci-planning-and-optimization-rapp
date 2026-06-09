@@ -1312,3 +1312,350 @@ const CellTable = ({ onSelect, selectedId }) => {
 };
 
 
+const DrilldownDrawer = ({ cell, onClose, onShowOnMap }) => {
+
+  const [replanState, setReplanState] = React.useState('idle');
+  const [proposal, setProposal]       = React.useState(null);
+  const [replanErr, setReplanErr]     = React.useState(null);
+
+  React.useEffect(() => {
+    setReplanState('idle'); setProposal(null); setReplanErr(null);
+  }, [cell?.id]);
+
+  if (!cell) return (
+    <>
+      <div className="drawer-mask" data-on="0"/>
+      <div className="drawer" data-on="0"/>
+    </>
+  );
+  const conflicts = (window.PCI_DATA.CONFLICTS || []).filter(c => (c.cells || []).includes(cell.id));
+
+  const startReplan = async () => {
+    setReplanState('proposing'); setReplanErr(null);
+    try {
+      const r = await fetch('/api/replan/propose', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ cell_id: cell.id }),
+      });
+      const data = await r.json();
+      if (!data.ok) { setReplanErr(data.error || 'Propose failed'); setReplanState('error'); return; }
+      setProposal(data);
+      setReplanState('proposed');
+    } catch (e) {
+      setReplanErr(e.message || 'Network error');
+      setReplanState('error');
+    }
+  };
+  const commitReplan = async () => {
+    if (!proposal) return;
+    setReplanState('committing'); setReplanErr(null);
+    try {
+      const r = await fetch('/api/replan/commit', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ cell_id: cell.id, proposed_pci: proposal.proposed_pci }),
+      });
+      const data = await r.json();
+      if (!data.ok) { setReplanErr(data.error || 'Commit failed'); setReplanState('error'); return; }
+      window.reloadPciData(undefined, { quiet: true });
+      setTimeout(() => { onClose && onClose(); }, 400);
+    } catch (e) {
+      setReplanErr(e.message || 'Network error');
+      setReplanState('error');
+    }
+  };
+  const cancelReplan = () => { setReplanState('idle'); setProposal(null); setReplanErr(null); };
+
+  return (
+    <>
+      <div className="drawer-mask" data-on="1" onClick={onClose}/>
+      <div className="drawer" data-on="1">
+        <div className="drawer-head">
+          <div>
+            <div className="row-h" style={{ gap: 10 }}>
+              <span className={`chip ${cell.status === 'active' ? 'ok' : cell.status === 'degraded' ? 'warn' : cell.status === 'maintenance' ? 'maint' : 'idle'}`}>
+                <span className="dot"/>{cell.status}
+              </span>
+              <span className="mono" style={{ color: 'var(--fg-3)', fontSize: 12 }}>PCI {cell.pci} · {cell.band} · sector {cell.sector}</span>
+            </div>
+            <h2 style={{ margin: '8px 0 2px', fontSize: 22, fontFamily: 'var(--font-display)', fontWeight: 600, letterSpacing: '-0.02em' }}>
+              {cell.id}
+            </h2>
+            <div style={{ fontSize: 14, color: 'var(--fg-2)' }}>{cell.site} · {cell.region}</div>
+          </div>
+          <button className="btn-sm" onClick={onClose}><Icon name="x" size={13}/></button>
+        </div>
+        <div className="drawer-body">
+          <div className="drawer-grid">
+            <div><div className="l">DL Throughput</div><div className="v">{cell.dl.toFixed(1)} Mbps</div></div>
+            <div><div className="l">UL Throughput</div><div className="v">{cell.ul.toFixed(1)} Mbps</div></div>
+            <div><div className="l">PRB Usage</div><div className="v">{cell.prb}%</div></div>
+            <div><div className="l">UE Connected</div><div className="v">{cell.ue}</div></div>
+            <div><div className="l">BLER</div><div className="v">{cell.bler}%</div></div>
+            <div><div className="l">CQI / SINR</div><div className="v">{cell.cqi.toFixed(1)} / {cell.sinr.toFixed(1)} dB</div></div>
+            <div><div className="l">Mod-3 Group</div><div className="v">{cell.pci % 3}</div></div>
+            <div><div className="l">Neighbours</div><div className="v">{cell.neighborCount ?? (cell.neighbors || []).length}</div></div>
+          </div>
+          {conflicts.length > 0 && (
+            <div>
+              <div style={{ fontSize: 12, color: 'var(--fg-3)', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 8 }}>Active Conflicts</div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                {conflicts.map(c => (
+                  <div key={c.id} style={{
+                    padding: 10, borderRadius: 6,
+                    border: '1px solid var(--line)',
+                    background: 'var(--bg-3)',
+                    fontSize: 13.5, color: 'var(--fg-2)'
+                  }}>
+                    <div className="row-h" style={{ gap: 8, marginBottom: 4 }}>
+                      <span className={`chip ${c.severity === 'critical' ? 'crit' : c.severity === 'major' ? 'warn' : 'info'}`}>
+                        <span className="dot"/>{c.severity}
+                      </span>
+                      <span className="mono" style={{ color: 'var(--fg)', fontSize: 13 }}>{c.id}</span>
+                      <span style={{ marginLeft: 'auto', textTransform: 'uppercase', fontSize: 12, letterSpacing: '0.04em' }}>{c.type}</span>
+                    </div>
+                    <div>{c.impact}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+          <div>
+            <div style={{ fontSize: 12, color: 'var(--fg-3)', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 8 }}>
+              Neighbour PCIs{(cell.neighborCount ?? 0) > (cell.neighbors || []).length ? ` · first ${(cell.neighbors || []).length} of ${cell.neighborCount}` : ''}
+            </div>
+            <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+              {(cell.neighbors || []).map(n => (
+                <span key={n} className="mono" style={{ padding: '4px 9px', border: '1px solid var(--line-2)', borderRadius: 4, fontSize: 13, color: 'var(--fg-2)' }}>
+                  PCI {n}
+                </span>
+              ))}
+              {!(cell.neighbors || []).length && (
+                <span style={{ fontSize: 13, color: 'var(--fg-3)' }}>No neighbour relations reported for this cell.</span>
+              )}
+            </div>
+          </div>
+          {replanState === 'idle' && (
+            <div className="row-h" style={{ gap: 8, marginTop: 6, flexWrap: 'wrap' }}>
+              {conflicts.length > 0 ? (
+                <button className="btn-sm primary" onClick={startReplan}>
+                  <Icon name="refresh" size={12}/>Re-plan PCI
+                </button>
+              ) : (
+                <span className="cell-ok-pill" title="PCI assignment is healthy — no re-plan required">
+                  <Icon name="check" size={12}/>
+                  No action needed
+                  <span className="sub">PCI {cell.pci} is conflict-free</span>
+                </span>
+              )}
+              <button className="btn-sm" onClick={() => onShowOnMap && onShowOnMap(cell)}>
+                <Icon name="map" size={12}/>Show on map
+              </button>
+            </div>
+          )}
+          {replanState === 'proposing' && (
+            <div className="replan-card" data-state="busy">
+              <div className="replan-card-head">
+                <span className="mono" style={{ color: 'var(--accent)' }}>● proposing</span>
+                <span style={{ color: 'var(--fg-3)', fontSize: 13 }}>Searching pool for a safe PCI…</span>
+              </div>
+            </div>
+          )}
+          {replanState === 'proposed' && proposal && (
+            <div className="replan-card" data-state="ready">
+              <div className="replan-card-head">
+                <span className="mono" style={{ color: 'var(--accent)', fontSize: 12, letterSpacing: '0.08em', textTransform: 'uppercase' }}>● Proposal ready</span>
+                <span style={{ color: 'var(--fg-3)', fontSize: 12 }}>{proposal.free_pcis_remaining} free PCIs in pool</span>
+              </div>
+              <div className="replan-card-swap">
+                <div className="replan-pci old"><div className="lbl">CURRENT</div><div className="v">PCI {proposal.old_pci}</div></div>
+                <div className="replan-arrow"><Icon name="arrowRt" size={20}/></div>
+                <div className="replan-pci new"><div className="lbl">PROPOSED</div><div className="v">PCI {proposal.proposed_pci}</div></div>
+              </div>
+              <div className="replan-reasons">
+                {proposal.reason.split(' · ').map((r, i) => (
+                  <div key={i} className="replan-reason"><span>✓</span>{r}</div>
+                ))}
+                {!proposal.mod3_safe && (
+                  <div className="replan-reason warn">⚠ mod-3 group fully occupied — minor PUSCH DMRS risk remains</div>
+                )}
+              </div>
+              <div className="row-h" style={{ gap: 8, marginTop: 12 }}>
+                <button className="btn-sm primary" onClick={commitReplan}>
+                  <Icon name="refresh" size={12}/>Confirm re-plan
+                </button>
+                <button className="btn-sm" onClick={cancelReplan}>Cancel</button>
+              </div>
+            </div>
+          )}
+          {replanState === 'committing' && (
+            <div className="replan-card" data-state="busy">
+              <div className="replan-card-head">
+                <span className="mono" style={{ color: 'var(--accent)' }}>● committing</span>
+                <span style={{ color: 'var(--fg-3)', fontSize: 13 }}>Applying PCI swap…</span>
+              </div>
+            </div>
+          )}
+          {replanState === 'error' && (
+            <div className="replan-card" data-state="error">
+              <div className="replan-card-head">
+                <span className="mono" style={{ color: 'var(--crit)' }}>● error</span>
+                <span style={{ color: 'var(--fg-2)', fontSize: 13 }}>{replanErr}</span>
+              </div>
+              <div className="row-h" style={{ gap: 8, marginTop: 10 }}>
+                <button className="btn-sm" onClick={cancelReplan}>Dismiss</button>
+                <button className="btn-sm primary" onClick={startReplan}>Retry</button>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+    </>
+  );
+};
+
+
+const TopologyPanel = ({ onSelect }) => {
+  const cells = window.PCI_DATA.CELLS;
+  const conflicts = window.PCI_DATA.CONFLICTS;
+  const conflictedIds = new Set(conflicts.flatMap(c => c.cells));
+  const regions = window.PCI_DATA.REGIONS_HEALTH;
+
+
+  const lats = cells.map(c => c.lat);
+  const lngs = cells.map(c => c.lng);
+  const latMin = lats.length ? Math.min(...lats) : 0;
+  const latMax = lats.length ? Math.max(...lats) : 1;
+  const lngMin = lngs.length ? Math.min(...lngs) : 0;
+  const lngMax = lngs.length ? Math.max(...lngs) : 1;
+  const latSpan = (latMax - latMin) || 1;
+  const lngSpan = (lngMax - lngMin) || 1;
+
+  const W = 460, H = 280, padX = 28, padY = 22;
+  const xy = (lat, lng) => ({
+    x: padX + ((lng - lngMin) / lngSpan) * (W - 2 * padX),
+    y: padY + (1 - (lat - latMin) / latSpan) * (H - 2 * padY),
+  });
+
+
+  const sev = (r) => r.conflicts === 0 ? 'ok' : r.conflicts >= 3 ? 'crit' : 'warn';
+  const barClass = (pct) => pct >= 90 ? 'ok' : pct >= 75 ? 'warn' : 'crit';
+  const sortedRegions = [...regions].sort((a, b) => {
+    if (b.conflicts !== a.conflicts) return b.conflicts - a.conflicts;
+    return a.pct - b.pct;
+  });
+
+  return (
+    <div className="panel topo-panel">
+      <div className="topo-head">
+        <div className="topo-head-titles">
+          <h4>Topology</h4>
+          <span className="topo-head-sub">{cells.length} cells · {regions.length} regions</span>
+        </div>
+        <button className="btn-sm"><Icon name="layers" size={12}/>Layers</button>
+      </div>
+
+      <div className="topo-canvas">
+        <div className="topo-legend">
+          <div className="topo-legend-title">Status</div>
+          <div className="topo-legend-row"><span className="topo-legend-dot" style={{ background: 'var(--accent)', color: 'var(--accent)' }}/>Active</div>
+          <div className="topo-legend-row"><span className="topo-legend-dot" style={{ background: 'var(--crit)', color: 'var(--crit)' }}/>In conflict</div>
+          <div className="topo-legend-row"><span className="topo-legend-dot" style={{ background: 'var(--warn)', color: 'var(--warn)' }}/>Degraded</div>
+          <div className="topo-legend-row"><span className="topo-legend-dot" style={{ background: 'var(--maint)', color: 'var(--maint)' }}/>Maintenance</div>
+        </div>
+        <div className="topo-compass">
+          <span className="topo-compass-needle">
+            <svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M12 2 L14 11 L12 22 L10 11 Z" fill="currentColor"/>
+            </svg>
+          </span>
+          <span>N · live grid</span>
+        </div>
+
+        <svg viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="xMidYMid meet" style={{ position: 'absolute', inset: 0, width: '100%', height: '100%' }}>
+          <defs>
+            <radialGradient id="topo-pulse">
+              <stop offset="0%" stopColor="var(--crit)" stopOpacity="0.45"/>
+              <stop offset="100%" stopColor="var(--crit)" stopOpacity="0"/>
+            </radialGradient>
+          </defs>
+          {conflicts.flatMap(cf => {
+            if (cf.cells.length < 2) return [];
+            const points = cf.cells.map(id => cells.find(c => c.id === id)).filter(Boolean);
+            return points.slice(1).map((p, i) => {
+              const a = xy(points[0].lat, points[0].lng);
+              const b = xy(p.lat, p.lng);
+              return <line key={cf.id + i} x1={a.x} y1={a.y} x2={b.x} y2={b.y}
+                stroke={cf.severity === 'critical' ? 'var(--crit)' : cf.severity === 'major' ? 'var(--warn)' : 'var(--info)'}
+                strokeWidth="1.1" strokeDasharray="3 4" opacity="0.55" />;
+            });
+          })}
+          {cells.map(c => {
+            const { x, y } = xy(c.lat, c.lng);
+            const isConfl = conflictedIds.has(c.id);
+            const fill =
+              c.status === 'active' ? (isConfl ? 'var(--crit)' : 'var(--accent)') :
+              c.status === 'degraded' ? 'var(--warn)' :
+              c.status === 'maintenance' ? 'var(--maint)' : 'var(--fg-4)';
+            return (
+              <g key={c.id} style={{ cursor: 'pointer' }} onClick={() => onSelect && onSelect(c)}>
+                {isConfl && (
+                  <circle cx={x} cy={y} r="14" fill="url(#topo-pulse)">
+                    <animate attributeName="r" values="9;16;9" dur="2.4s" repeatCount="indefinite"/>
+                    <animate attributeName="opacity" values="0.9;0.1;0.9" dur="2.4s" repeatCount="indefinite"/>
+                  </circle>
+                )}
+                <circle cx={x} cy={y} r={isConfl ? 4.2 : 3.4} fill={fill} stroke="var(--bg)" strokeWidth="1.2"/>
+              </g>
+            );
+          })}
+        </svg>
+      </div>
+
+      <div className="topo-regions">
+        {sortedRegions.map(r => {
+          const s = sev(r);
+          return (
+            <div key={r.name} className={`topo-region ${s}`}>
+              <div className="topo-region-head">
+                <span className="topo-region-name">{r.name}</span>
+                <span className="topo-region-status">
+                  {r.conflicts === 0 ? (
+                    <span className="check">
+                      <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                        <path d="M20 6 9 17l-5-5"/>
+                      </svg>
+                      Healthy
+                    </span>
+                  ) : (
+                    <>
+                      <span className="n">{r.conflicts}</span>
+                      <span className="l">{r.conflicts === 1 ? 'Issue' : 'Issues'}</span>
+                    </>
+                  )}
+                </span>
+              </div>
+              <div className="topo-region-body">
+                <div className="topo-region-bar">
+                  <div className={`topo-region-bar-fill ${barClass(r.pct)}`} style={{ width: r.pct + '%' }}/>
+                </div>
+                <span className="pct">{r.pct}%</span>
+              </div>
+              <div className="meta" style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--fg-3)', fontWeight: 600 }}>
+                {r.ok} / {r.cells} cells active
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+};
+
+
+Object.assign(window, {
+  Icon, KpiStrip, ChartPanel, AlertsPanel, PciPoolPanel,
+  CellTable, DrilldownDrawer, TopologyPanel,
+  buildConflictHistory, spanLabel, computePulse, feedStatus, FeedPill,
+});
