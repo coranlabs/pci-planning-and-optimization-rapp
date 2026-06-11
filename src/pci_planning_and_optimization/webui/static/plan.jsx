@@ -240,3 +240,310 @@ function PlanView({ embedded }) {
   );
 }
 
+function PlanEmpty({ plans, onOpen, onPick, onImported }) {
+  const [samples, setSamples] = React.useState([]);
+  const [loading, setLoading] = React.useState(null);
+  React.useEffect(() => {
+    fetch('/api/plan/samples').then(r => r.json()).then(setSamples).catch(() => {});
+  }, []);
+
+  const runSample = (region) => {
+    setLoading(region);
+    fetch(`/api/plan/samples/${encodeURIComponent(region)}`, { method: 'POST' })
+      .then(r => r.json())
+      .then(b => { if (b.plan_id && onImported) onImported(b.plan_id); })
+      .finally(() => setLoading(null));
+  };
+
+  return (
+    <div className="panel plan-empty">
+      <div className="plan-empty-icon"><Icon name="upload" size={22}/></div>
+      <h3 className="panel-title">Import a cell plan to begin</h3>
+      <p className="panel-sub plan-empty-copy">
+        A sheet with one row per cell. <b>cell_id, lat, lng, pci, neighbors</b> are
+        required; <b>technology, azimuth, arfcn, cell_type</b> are optional.
+        The neighbours column is that cell's neighbour relation table — a
+        comma-separated list of the cell_ids it can hand over to.
+      </p>
+      <div className="plan-empty-actions">
+        <button className="btn-sm primary" onClick={onPick}>
+          <Icon name="upload" size={12}/>Import plan
+        </button>
+        <a className="btn-sm" href="/api/plan/template" download>
+          <Icon name="file" size={12}/>Download template
+        </a>
+      </div>
+      {samples.length > 0 && (
+        <div className="plan-recent">
+          <div className="ctl-label">Or start from a sample</div>
+          <div className="panel-sub" style={{ marginTop: 4, marginBottom: 8 }}>
+            Built from the network the rApp has ingested — real coordinates,
+            neighbour relations and current PCIs.
+          </div>
+          <div className="plan-recent-list">
+            {samples.map(sm => (
+              <button key={sm.id} className="plan-recent-item" disabled={loading === sm.id}
+                onClick={() => runSample(sm.id)}>
+                <span className="pri-name">{sm.name}</span>
+                <span className="pri-meta">
+                  {loading === sm.id ? 'Optimising…' : `${sm.cells} cells`}
+                </span>
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {plans.length > 0 && (
+        <div className="plan-recent">
+          <div className="ctl-label">Previously imported</div>
+          <div className="plan-recent-list">
+            {plans.map(p => (
+              <button key={p.id} className="plan-recent-item" onClick={() => onOpen(p.id)}>
+                <span className="pri-name">{p.filename}</span>
+                <span className="pri-meta">{p.cell_count} cells · {p.changes} changes</span>
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function PlanStat({ label, value, hint, tone }) {
+  return (
+    <div className="panel plan-stat">
+      <div className="plan-stat-label">{label}</div>
+      <div className={`plan-stat-value${tone ? ' tone-' + tone : ''}`}>{value}</div>
+      {hint && <div className="plan-stat-hint">{hint}</div>}
+    </div>
+  );
+}
+
+function PlanLegend({ colorBy, view }) {
+
+
+  const present = React.useMemo(() => {
+    const seen = new Set();
+    ((view && view.edges) || []).forEach(e => { if (!e.resolved) seen.add(e.type); });
+    return ['collision', 'confusion', 'mod3', 'mod4', 'mod30'].filter(k => seen.has(k));
+  }, [view]);
+  const anyResolved = ((view && view.edges) || []).some(e => e.resolved);
+
+  return (
+    <div className="plan-legend">
+      <div className="plegend-group">
+        <span className="plegend-head">Cells</span>
+        {colorBy === 'pci' ? (
+          <span className="plegend-item">
+            <i className="plegend-ramp"/>
+            <span className="plegend-txt"><b>PCI</b><em>Hue identifies the assigned PCI</em></span>
+          </span>
+        ) : (
+          <>
+            {present.map(k => (
+              <span className="plegend-item" key={k}>
+                <i className="plegend-dot" style={{ background: SEV_COLOR[k] }}/>
+                <span className="plegend-txt"><b>{CLASS_LABEL[k]}</b><em>{CLASS_MEANING[k]}</em></span>
+              </span>
+            ))}
+            <span className="plegend-item">
+              <i className="plegend-dot" style={{ background: SEV_COLOR.clean }}/>
+              <span className="plegend-txt"><b>Clean</b><em>No conflict on this cell</em></span>
+            </span>
+          </>
+        )}
+        <span className="plegend-item">
+          <i className="plegend-dot ring"/>
+          <span className="plegend-txt"><b>Re-assigned</b><em>PCI changed by the plan</em></span>
+        </span>
+      </div>
+
+      <div className="plegend-group">
+        <span className="plegend-head">Relations</span>
+        {present.map(k => (
+          <span className="plegend-item" key={k}>
+            <i className="plegend-line" style={{
+              background: EDGE_STYLE[k].color,
+              height: Math.max(2, EDGE_STYLE[k].width),
+            }}/>
+            <span className="plegend-txt"><b>{CLASS_LABEL[k]} pair</b></span>
+          </span>
+        ))}
+        {anyResolved && (
+          <span className="plegend-item">
+            <i className="plegend-line" style={{ background: RESOLVED_COLOR, height: 2 }}/>
+            <span className="plegend-txt"><b>Resolved</b><em>Fixed by the plan</em></span>
+          </span>
+        )}
+        {present.length === 0 && !anyResolved && (
+          <span className="plegend-item"><span className="plegend-txt"><em>No conflicting pairs</em></span></span>
+        )}
+      </div>
+    </div>
+  );
+}
+
+
+const R_EARTH = 6378137;
+
+
+const SECTOR_FAN_M = 55;
+
+function offsetLngLat(lat, lng, bearingDeg, metres) {
+  const dLat = (metres * Math.cos(bearingDeg * Math.PI / 180)) / 111320;
+  const dLng = (metres * Math.sin(bearingDeg * Math.PI / 180)) /
+               (111320 * Math.cos(lat * Math.PI / 180) || 1);
+  return [lng + dLng, lat + dLat];
+}
+
+
+const SEV_RANK = { collision: 5, confusion: 4, mod3: 3, mod4: 2, mod30: 1 };
+
+function severityByCell(edges) {
+  const out = {};
+  (edges || []).forEach(e => {
+    if (e.resolved) return;
+    const r = SEV_RANK[e.type] || 0;
+    [e.a, e.b].forEach(id => {
+      if (!out[id] || (SEV_RANK[out[id]] || 0) < r) out[id] = e.type;
+    });
+  });
+  return out;
+}
+
+const SEV_COLOR = {
+  collision: '#dc2626',
+  confusion: '#f59e0b',
+  mod3: '#8b5cf6',
+  mod4: '#0ea5e9',
+  mod30: '#14b8a6',
+  clean: '#94a3b8',
+};
+
+function planCellGeoJSON(view, { colorBy, changedIds, side }) {
+  const cells = (view && view.cells) || [];
+  const sev = severityByCell(view && view.edges);
+
+
+  const bySite = new Map();
+  cells.forEach(c => {
+    const k = `${c.lat},${c.lng}`;
+    if (!bySite.has(k)) bySite.set(k, []);
+    bySite.get(k).push(c);
+  });
+
+  const features = [];
+  bySite.forEach(group => {
+    group.forEach((c, i) => {
+      if (typeof c.lat !== 'number' || typeof c.lng !== 'number') return;
+      const bearing = typeof c.azimuth === 'number'
+        ? c.azimuth
+        : (360 / group.length) * i;
+
+      const metres = group.length > 1 ? SECTOR_FAN_M : 0;
+      const [lng, lat] = metres
+        ? offsetLngLat(c.lat, c.lng, bearing, metres)
+        : [c.lng, c.lat];
+      const status = sev[c.id] || 'clean';
+      const changed = side === 'after' && changedIds.has(c.id);
+      features.push({
+        type: 'Feature',
+        properties: {
+          id: c.id,
+          pci: c.pci,
+          tech: c.tech || '',
+          cellType: c.cell_type || '',
+          azimuth: typeof c.azimuth === 'number' ? c.azimuth : null,
+          status,
+          changed,
+          color: colorBy === 'pci' ? pciColor(c.pci) : (SEV_COLOR[status] || SEV_COLOR.clean),
+          sortKey: changed ? 3 : (status === 'collision' ? 2 : status === 'confusion' ? 1 : 0),
+          anchorLng: c.lng,
+          anchorLat: c.lat,
+        },
+        geometry: { type: 'Point', coordinates: [lng, lat] },
+      });
+    });
+  });
+  return { type: 'FeatureCollection', features };
+}
+
+function planEdgeGeoJSON(view, positions, filter) {
+  const feats = [];
+  if (filter === 'none') return { type: 'FeatureCollection', features: [] };
+  const hasHard = (view.edges || []).some(
+    e => !e.resolved && (e.type === 'collision' || e.type === 'confusion'));
+  (view.edges || []).forEach(e => {
+
+
+    const effective = filter === 'auto' ? (hasHard ? 'hard' : 'all') : filter;
+    if (effective === 'hard' && !e.resolved
+        && e.type !== 'collision' && e.type !== 'confusion') return;
+    if (effective === 'collision' && e.type !== 'collision' && !e.resolved) return;
+    const a = positions[e.a], b = positions[e.b];
+    if (!a || !b) return;
+    feats.push({
+      type: 'Feature',
+      properties: {
+        color: e.resolved ? RESOLVED_COLOR : (EDGE_STYLE[e.type] || EDGE_STYLE.confusion).color,
+        resolved: !!e.resolved,
+        weight: e.resolved ? 1 : (e.type === 'collision' ? 3 : 2),
+      },
+      geometry: { type: 'LineString', coordinates: [a, b] },
+    });
+  });
+  return { type: 'FeatureCollection', features: feats };
+}
+
+
+function addPlanLayers(m) {
+  if (!m.getSource('plan-edges')) {
+    m.addSource('plan-edges', { type: 'geojson', data: EMPTY_FC });
+  }
+  if (!m.getSource('plan-cells')) {
+    m.addSource('plan-cells', { type: 'geojson', data: EMPTY_FC });
+  }
+
+  if (!m.getLayer('plan-edges')) {
+    m.addLayer({
+      id: 'plan-edges',
+      type: 'line',
+      source: 'plan-edges',
+      layout: { 'line-cap': 'round' },
+      paint: {
+        'line-color': ['get', 'color'],
+        'line-width': ['interpolate', ['linear'], ['zoom'],
+          9, ['*', ['get', 'weight'], 0.35],
+          13, ['*', ['get', 'weight'], 0.8],
+          16, ['*', ['get', 'weight'], 1.6]],
+
+
+        'line-opacity': ['case',
+          ['get', 'resolved'], 0.55,
+          ['==', ['get', 'weight'], 3], 0.6,
+          0.2],
+      },
+    });
+  }
+
+
+  if (!m.getLayer('plan-cells')) {
+    m.addLayer({
+      id: 'plan-cells',
+      type: 'circle',
+      source: 'plan-cells',
+      paint: {
+        'circle-radius': ['interpolate', ['linear'], ['zoom'],
+          8, 2.4, 11, 4.2, 14, 7, 17, 12],
+        'circle-color': ['get', 'color'],
+        'circle-stroke-width': ['case', ['get', 'changed'], 2.2, 1],
+        'circle-stroke-color': ['case', ['get', 'changed'], CHANGED_COLOR,
+          document.documentElement.classList.contains('theme-light') ? '#ffffff' : '#0E1428'],
+        'circle-opacity': 0.95,
+      },
+    });
+  }
+}
+
