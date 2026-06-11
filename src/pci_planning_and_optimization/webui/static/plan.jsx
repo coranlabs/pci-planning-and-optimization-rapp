@@ -547,3 +547,172 @@ function addPlanLayers(m) {
   }
 }
 
+function PlanMap({ view, side, changes, colorBy, filter }) {
+  const elRef = React.useRef(null);
+  const mapRef = React.useRef(null);
+  const [ready, setReady] = React.useState(false);
+  const themeObsRef = React.useRef(null);
+  const fittedRef = React.useRef(null);
+  const changedIds = React.useMemo(
+    () => new Set((changes || []).map(c => c.cell_id)), [changes]
+  );
+
+  React.useEffect(() => {
+    if (!elRef.current || mapRef.current) return;
+    const theme = document.documentElement.classList.contains('theme-light') ? 'light' : 'dark';
+    const cells = (view && view.cells) || [];
+    const valid = cells.filter(c => typeof c.lat === 'number' && typeof c.lng === 'number');
+    const center = valid.length
+      ? [valid.reduce((a, c) => a + c.lng, 0) / valid.length,
+         valid.reduce((a, c) => a + c.lat, 0) / valid.length]
+      : [-6.26, 53.35];
+
+    const m = new window.maplibregl.Map({
+      container: elRef.current,
+      style: planMapStyle(theme),
+      center, zoom: 11, minZoom: 3, maxZoom: 18,
+      attributionControl: { compact: true },
+    });
+    m.addControl(new window.maplibregl.NavigationControl({ showCompass: false }), 'top-right');
+    m.addControl(new window.maplibregl.ScaleControl({ unit: 'metric' }), 'bottom-left');
+
+    m.on('load', () => {
+      addPlanLayers(m);
+
+      const pop = new window.maplibregl.Popup({
+        offset: 12, closeButton: false, className: 'plan-pop',
+      });
+      m.on('mouseenter', 'plan-cells', () => { m.getCanvas().style.cursor = 'pointer'; });
+      m.on('mouseleave', 'plan-cells', () => {
+        m.getCanvas().style.cursor = '';
+        pop.remove();
+      });
+      m.on('mousemove', 'plan-cells', (ev) => {
+        const f = ev.features && ev.features[0];
+        if (!f) return;
+        const p = f.properties;
+        pop.setLngLat(f.geometry.coordinates)
+          .setHTML(
+            `<div class="plan-pop-body">
+               <div class="plan-pop-id">${p.id}</div>
+               <div class="plan-pop-row"><span>PCI</span><b>${p.pci}</b></div>
+               <div class="plan-pop-row"><span>Status</span><b class="sev-${p.status}">${p.status}</b></div>
+               ${p.azimuth !== null && p.azimuth !== undefined
+                 ? `<div class="plan-pop-row"><span>Azimuth</span><b>${p.azimuth}°</b></div>` : ''}
+               <div class="plan-pop-row"><span>Type</span><b>${(p.tech || '').toUpperCase()} · ${p.cellType}</b></div>
+               ${p.changed === true || p.changed === 'true'
+                 ? '<div class="plan-pop-changed">Re-assigned by the plan</div>' : ''}
+             </div>`)
+          .addTo(m);
+      });
+      setReady(true);
+    });
+    mapRef.current = m;
+    window.__planMap = m;
+
+
+    let current = theme;
+    const obs = new MutationObserver(() => {
+      const next = document.documentElement.classList.contains('theme-light') ? 'light' : 'dark';
+      if (next === current) return;
+      current = next;
+      setReady(false);
+      m.setStyle(planMapStyle(next));
+
+      m.once('styledata', () => { addPlanLayers(m); setReady(true); });
+    });
+    obs.observe(document.documentElement, { attributes: true, attributeFilter: ['class'] });
+    themeObsRef.current = obs;
+    return () => {
+      if (themeObsRef.current) themeObsRef.current.disconnect();
+      m.remove(); mapRef.current = null; window.__planMap = null; setReady(false);
+    };
+
+  }, []);
+
+  React.useEffect(() => {
+    const m = mapRef.current;
+    if (!m || !ready || !view) return;
+
+    const cellFC = planCellGeoJSON(view, { colorBy, changedIds, side });
+
+
+    const pos = {};
+    cellFC.features.forEach(f => { pos[f.properties.id] = f.geometry.coordinates; });
+
+    m.getSource('plan-cells').setData(cellFC);
+    m.getSource('plan-edges').setData(planEdgeGeoJSON(view, pos, filter));
+
+
+    const key = (view.cells || []).length + ':' + (view.cells || [])[0]?.id;
+    if (fittedRef.current !== key && cellFC.features.length > 1) {
+      fittedRef.current = key;
+      const c0 = cellFC.features[0].geometry.coordinates;
+      const b = new window.maplibregl.LngLatBounds(c0, c0);
+      cellFC.features.forEach(f => b.extend(f.geometry.coordinates));
+      m.fitBounds(b, { padding: 70, maxZoom: 14, duration: 500 });
+    }
+  }, [view, side, ready, colorBy, filter, changedIds]);
+
+  return <div ref={elRef} className="plan-map"/>;
+}
+function ChangeList({ changes }) {
+  return (
+    <div className="panel plan-list-panel">
+      <div className="panel-head"><div className="titles">
+        <h3 className="panel-title">Recommended changes</h3>
+        <div className="panel-sub">{changes.length} cell{changes.length === 1 ? '' : 's'} re-assigned</div>
+      </div></div>
+      {changes.length === 0
+        ? <div className="plan-empty-row">No changes required — the plan is already conflict-free.</div>
+        : (
+          <div className="plan-scroll">
+            {changes.map((c, i) => (
+              <div key={`${c.cell_id}-${i}`} className="plan-change">
+                <span className="pc-id" title={c.cell_id}>{c.cell_id}</span>
+                <span className="pc-pci">
+                  <b style={{ color: pciColor(c.pci_old) }}>{c.pci_old}</b>
+                  <i className="pc-arrow">→</i>
+                  <b style={{ color: pciColor(c.pci_new) }}>{c.pci_new}</b>
+                </span>
+              </div>
+            ))}
+          </div>
+        )}
+    </div>
+  );
+}
+
+function ConflictList({ view, side }) {
+  const edges = (view && view.edges) || [];
+  const shown = edges.slice(0, 300);
+  return (
+    <div className="panel plan-list-panel">
+      <div className="panel-head"><div className="titles">
+        <h3 className="panel-title">Conflicts · {side.toUpperCase()}</h3>
+        <div className="panel-sub">
+          {edges.length} pair{edges.length === 1 ? '' : 's'}
+          {edges.length > shown.length ? ` · showing first ${shown.length}` : ''}
+        </div>
+      </div></div>
+      {edges.length === 0
+        ? <div className="plan-empty-row">No collision or confusion pairs.</div>
+        : (
+          <div className="plan-scroll">
+            {shown.map((e, i) => (
+              <div key={i} className="plan-conflict">
+                <span className="pcf-pair">
+                  <span title={e.a}>{e.a}</span>
+                  <i className="pcf-link"/>
+                  <span title={e.b}>{e.b}</span>
+                </span>
+                <span className={`pcf-tag ${e.resolved ? 'resolved' : e.type}`}>
+                  {e.resolved ? 'resolved' : e.type}
+                </span>
+              </div>
+            ))}
+          </div>
+        )}
+    </div>
+  );
+}
