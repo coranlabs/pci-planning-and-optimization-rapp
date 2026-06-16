@@ -1253,3 +1253,334 @@ function BigTopo({ onSelectCell, selectedCell, colorMode = 'status', showOverlay
 }
 
 
+function ConflictsOverlay({ mapRef, cells, conflicts, onSelectCell }) {
+  const active = conflicts.filter(c =>
+    (c.type === 'collision' || c.type === 'confusion')
+    && (c.severity === 'critical' || c.severity === 'major')
+  );
+  if (!active.length) return null;
+  const focusConflict = (cf) => {
+    const m = mapRef.current; if (!m) return;
+    const pts = cf.cells.map(id => cells.find(c => c.id === id)).filter(Boolean);
+    if (pts.length < 2) return;
+    const lngs = pts.map(c => c.lng);
+    const lats = pts.map(c => c.lat);
+    const bounds = new window.maplibregl.LngLatBounds(
+      [Math.min(...lngs), Math.min(...lats)],
+      [Math.max(...lngs), Math.max(...lats)],
+    );
+    m.fitBounds(bounds, {
+      padding: { top: 80, right: 320, bottom: 80, left: 80 },
+
+
+      maxZoom: 16.5,
+      duration: 700,
+    });
+
+
+  };
+  return (
+    <div className="map-conflicts">
+      <div className="map-conflicts-head">
+        <span className="dot crit"/>
+        <span className="title">Active conflicts</span>
+        <span className="count">{active.length}</span>
+      </div>
+      <div className="map-conflicts-list">
+        {active.map(cf => (
+          <button key={cf.id} className={`map-conflicts-row sev-${cf.severity}`} onClick={() => focusConflict(cf)}>
+            <span className="bar"/>
+            <div className="meta">
+              <div className="row1">
+                <span className={`kind ${cf.type}`}>{cf.type === 'collision' ? 'COLLISION' : 'CONFUSION'}</span>
+                <span className="pci">PCI {cf.pci}</span>
+              </div>
+              <div className="row2">
+                {cf.cells.join(' \u2194 ')}
+              </div>
+            </div>
+            <span className="focus" title="Fit map to this conflict">FOCUS</span>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function getCSSVar(name) {
+  return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+}
+
+function RegionPanel() {
+  const regions = window.PCI_DATA.REGIONS_HEALTH;
+
+  const totalCells     = regions.reduce((a, r) => a + r.cells,     0);
+  const totalClean     = regions.reduce((a, r) => a + r.ok,        0);
+  const totalIssues    = regions.reduce((a, r) => a + r.conflicts, 0);
+  const healthyRegions = regions.filter(r => r.conflicts === 0).length;
+
+
+  const sorted = [...regions].sort((a, b) => {
+    if (b.conflicts !== a.conflicts) return b.conflicts - a.conflicts;
+    return a.pct - b.pct;
+  });
+
+
+  const severity = (r) => r.conflicts === 0 ? 'ok' : r.conflicts >= 3 ? 'crit' : 'warn';
+
+
+  const barClass = (pct) => pct >= 90 ? 'ok' : pct >= 75 ? 'warn' : 'crit';
+
+  return (
+    <div className="panel rh-panel">
+      <div className="rh-head">
+        <div className="rh-head-titles">
+          <h4>Regional Health</h4>
+          <span className="rh-head-sub">{regions.length} region{regions.length === 1 ? '' : 's'} reported by the PM feed · sorted by severity</span>
+        </div>
+      </div>
+
+      <div className="rh-summary">
+        <div className="rh-summary-stat ok">
+          <span className="n">{totalClean}</span>
+          <span className="l">/ {totalCells} conflict-free</span>
+        </div>
+        <div className="rh-summary-divider"/>
+        <div className={`rh-summary-stat ${totalIssues > 0 ? 'crit' : 'ok'}`}>
+          <span className="n">{totalIssues}</span>
+          <span className="l">open issue{totalIssues === 1 ? '' : 's'}</span>
+        </div>
+        <div className="rh-summary-divider"/>
+        <div className={`rh-summary-stat ${healthyRegions === regions.length ? 'ok' : 'warn'}`}>
+          <span className="n">{healthyRegions}</span>
+          <span className="l">healthy region{healthyRegions === 1 ? '' : 's'}</span>
+        </div>
+      </div>
+
+      <div className="rh-rows">
+        {sorted.map(r => {
+          const sev = severity(r);
+
+          const focus = () => window.__focusMapRegion && window.__focusMapRegion(r.name);
+          return (
+            <div key={r.name} className={`rh-row ${sev} clickable`}
+                 role="button" tabIndex={0}
+                 title={`Focus ${r.name} on the map`}
+                 onClick={focus}
+                 onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); focus(); } }}>
+              <div className="rh-row-meta">
+                <div className="name">{r.name}</div>
+                <div className="caption">{r.ok} / {r.cells} cells conflict-free</div>
+              </div>
+              <span className={`rh-row-status ${sev}`}>
+                {r.conflicts === 0 ? (
+                  <span className="check">
+                    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M20 6 9 17l-5-5"/>
+                    </svg>
+                    Healthy
+                  </span>
+                ) : (
+                  <>
+                    <span className="n">{r.conflicts}</span>
+                    <span className="l">{r.conflicts === 1 ? 'Issue' : 'Issues'}</span>
+                  </>
+                )}
+              </span>
+              <div className="rh-row-progress">
+                <div className="rh-bar">
+                  <div className={`rh-bar-fill ${barClass(r.pct)}`} style={{ width: r.pct + '%' }}/>
+                </div>
+                <span className="rh-bar-pct" title="Share of cells in no conflict">{r.pct}%</span>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+
+const DH_COLORS = { collision: 'var(--crit)', confusion: 'var(--warn)', modn: 'var(--info)' };
+
+
+function DhRing({ pct, color }) {
+  const r = 17, c = 2 * Math.PI * r;
+  const frac = Math.max(0, Math.min(100, pct)) / 100;
+  return (
+    <svg className="dh-stat-fig" viewBox="0 0 44 44">
+      <circle cx="22" cy="22" r={r} fill="none" stroke="var(--bg-3)" strokeWidth="5"/>
+      <circle cx="22" cy="22" r={r} fill="none" stroke={color} strokeWidth="5"
+        strokeLinecap="round" strokeDasharray={`${c * frac} ${c}`}
+        transform="rotate(-90 22 22)"/>
+    </svg>
+  );
+}
+
+
+function DhStatBand({ history, replans }) {
+  const s = history.summary;
+  const d = s.deltaVsStart;
+  const span = s.spanMin >= 1 ? `the last ${spanLabel(s.spanMin)}` : 'the first sample';
+
+  const deltaCls = d < 0 ? 'down' : d > 0 ? 'up' : 'flat';
+  const deltaTxt = s.spanMin < 1 ? 'history starts now'
+    : d === 0 ? `— unchanged over ${spanLabel(s.spanMin)}` : `${d < 0 ? '▼' : '▲'} ${Math.abs(d)} vs ${spanLabel(s.spanMin)} ago`;
+
+
+  const conflicts = window.PCI_DATA.CONFLICTS || [];
+  const nCol = conflicts.filter(c => c.type === 'collision').length;
+  const nCnf = conflicts.filter(c => c.type === 'confusion').length;
+  const nMod = conflicts.filter(c => c.type === 'mod3').length;
+  const liveTotal = s.liveTotal || 0;
+
+  const peakFrac = s.peak > 0 ? Math.round((liveTotal / s.peak) * 100) : 0;
+
+  return (
+    <div className="dh-band">
+      <div className={`panel dh-stat ${liveTotal > 0 ? 'crit' : 'ok'}`}>
+        <div className="dh-stat-label">Active conflicts</div>
+        <div className="dh-stat-value">{liveTotal}</div>
+        <div className="dh-stat-fig-row">
+          <span className="dh-segbar">
+            {liveTotal > 0 ? <>
+              {nCol > 0 && <span style={{ flex: nCol, background: 'var(--crit)' }}/>}
+              {nCnf > 0 && <span style={{ flex: nCnf, background: 'var(--warn)' }}/>}
+              {nMod > 0 && <span style={{ flex: nMod, background: 'var(--info)' }}/>}
+            </> : <span style={{ flex: 1, background: 'var(--ok)' }}/>}
+          </span>
+        </div>
+        <div className="dh-stat-foot">
+          <span className={`dh-delta ${deltaCls}`}>{deltaTxt}</span>
+        </div>
+      </div>
+
+      <div className="panel dh-stat warn">
+        <div className="dh-stat-label">Peak conflicts</div>
+        <div className="dh-stat-value">{s.peak}</div>
+        <div className="dh-stat-fig-row">
+          <span className="dh-gauge">
+            <span style={{ width: `${peakFrac}%`, background: 'var(--warn)' }}/>
+          </span>
+          <span className="dh-fig-cap">now {liveTotal}</span>
+        </div>
+        <div className="dh-stat-foot">highest in {span}</div>
+      </div>
+
+      <div className="panel dh-stat info">
+        <div className="dh-stat-label">PCI changes committed</div>
+        <div className="dh-stat-value">{replans.length}</div>
+        <div className="dh-stat-foot">operator re-plans written to SDNR this session</div>
+      </div>
+
+      <div className="panel dh-stat ok">
+        <div className="dh-stat-label">Avg conflict-free cells</div>
+        <div className="dh-stat-value">{s.avgHealthPct}<span className="u">%</span></div>
+        <div className="dh-stat-foot">mean over {span}</div>
+        <DhRing pct={s.avgHealthPct} color="var(--ok)"/>
+      </div>
+    </div>
+  );
+}
+
+
+function DhTrendChart({ history }) {
+  const pts = history.points;
+  const [hover, setHover] = React.useState(null);
+  const W = 960, H = 300, padT = 12, padB = 8;
+  const innerH = H - padT - padB;
+  const yMax = Math.max(4, Math.ceil(Math.max(...pts.map(p => p.total), 1) * 1.25));
+  const x = (i) => (i / Math.max(1, pts.length - 1)) * W;
+  const y = (v) => padT + innerH - (v / yMax) * innerH;
+
+
+  const layer = (key, below) => {
+    const top = pts.map((p, i) => {
+      const stack = (key === 'modn' ? p.modn
+        : key === 'confusion' ? p.modn + p.confusion
+        : p.modn + p.confusion + p.collision);
+      return [x(i), y(stack)];
+    });
+    const base = pts.map((p, i) => {
+      const stack = below === 'none' ? 0
+        : below === 'modn' ? p.modn
+        : p.modn + p.confusion;
+      return [x(i), y(stack)];
+    }).reverse();
+    return [...top, ...base].map(c => c.join(',')).join(' ');
+  };
+  const yTicks = 4;
+  const ticks = Array.from({ length: yTicks + 1 }, (_, i) => Math.round((yMax / yTicks) * i));
+  const xEvery = Math.ceil(pts.length / 8);
+
+  const onMove = (e) => {
+    const r = e.currentTarget.getBoundingClientRect();
+    const ratio = (e.clientX - r.left) / r.width;
+    const idx = Math.max(0, Math.min(pts.length - 1, Math.round(ratio * (pts.length - 1))));
+    setHover({ idx, p: pts[idx] });
+  };
+
+  return (
+    <div className="dh-chart-wrap">
+      <svg className="dh-chart-svg" viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none"
+        onMouseMove={onMove} onMouseLeave={() => setHover(null)}>
+        <defs>
+          {['collision', 'confusion', 'modn'].map(k => (
+            <linearGradient key={k} id={`dh-g-${k}`} x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stopColor={DH_COLORS[k]} stopOpacity="0.55"/>
+              <stop offset="100%" stopColor={DH_COLORS[k]} stopOpacity="0.12"/>
+            </linearGradient>
+          ))}
+        </defs>
+        {ticks.map((v, i) => (
+          <line key={i} x1={0} x2={W} y1={y(v)} y2={y(v)} className="dh-chart-grid"/>
+        ))}
+        <polygon points={layer('modn', 'none')}      fill="url(#dh-g-modn)"/>
+        <polygon points={layer('confusion', 'modn')} fill="url(#dh-g-confusion)"/>
+        <polygon points={layer('collision', 'confusion')} fill="url(#dh-g-collision)"/>
+        <polyline fill="none" stroke="var(--crit)" strokeWidth="1.8"
+          vectorEffect="non-scaling-stroke"
+          points={pts.map((p, i) => `${x(i)},${y(p.total)}`).join(' ')}/>
+        {hover && (
+          <g>
+            <line x1={x(hover.idx)} x2={x(hover.idx)} y1={padT} y2={padT + innerH}
+              stroke="var(--fg-3)" strokeDasharray="2 3" vectorEffect="non-scaling-stroke"/>
+            <circle cx={x(hover.idx)} cy={y(hover.p.total)} r="3.5" fill="var(--crit)"/>
+          </g>
+        )}
+      </svg>
+      <div className="dh-chart-axis-y">
+        {ticks.map((v, i) => (
+          <span key={i} style={{ top: `${((y(v) - padT) / innerH) * 100}%` }}>{v}</span>
+        ))}
+      </div>
+      <div className="dh-chart-axis-x">
+        {pts.map((p, i) => i % xEvery === 0 && (
+          <span key={i} style={{ left: `${(x(i) / W) * 100}%` }}>{p.label}</span>
+        ))}
+      </div>
+      {hover && (
+        <div className="dh-chart-tip" style={{
+          left: `calc(${(x(hover.idx) / W) * 100}% + 14px)`, top: 10,
+        }}>
+          <div className="tt">{hover.p.label}</div>
+          <div className="tr"><span><i style={{ background: DH_COLORS.collision }}/>Collision</span><span>{hover.p.collision}</span></div>
+          <div className="tr"><span><i style={{ background: DH_COLORS.confusion }}/>Confusion</span><span>{hover.p.confusion}</span></div>
+          <div className="tr"><span><i style={{ background: DH_COLORS.modn }}/>Mod-N</span><span>{hover.p.modn}</span></div>
+          <div className="tr" style={{ borderTop: '1px solid var(--line)', marginTop: 4, paddingTop: 4 }}>
+            <span style={{ color: 'var(--fg)' }}>Total</span>
+            <span style={{ color: 'var(--fg)' }}>{hover.p.total}</span>
+          </div>
+        </div>
+      )}
+      <div className="dh-legend">
+        <div className="dh-legend-item"><i style={{ background: DH_COLORS.collision }}/>Collision</div>
+        <div className="dh-legend-item"><i style={{ background: DH_COLORS.confusion }}/>Confusion</div>
+        <div className="dh-legend-item"><i style={{ background: DH_COLORS.modn }}/>Mod-N interference</div>
+      </div>
+    </div>
+  );
+}
+
+
