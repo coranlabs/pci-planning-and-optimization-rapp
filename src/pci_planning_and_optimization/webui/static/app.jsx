@@ -1584,3 +1584,794 @@ function DhTrendChart({ history }) {
 }
 
 
+function DhWorstRegions() {
+  const cells = window.PCI_DATA.CELLS || [];
+  const conflicts = window.PCI_DATA.CONFLICTS || [];
+  const regionByCell = {};
+  cells.forEach(c => { if (c.id) regionByCell[c.id] = c.region || '—'; });
+  const tally = {};
+  conflicts.forEach(cf => {
+    const touched = new Set((cf.cells || []).map(cid => regionByCell[cid]).filter(Boolean));
+    touched.forEach(r => { tally[r] = (tally[r] || 0) + 1; });
+  });
+  const ranked = Object.entries(tally).sort((a, b) => b[1] - a[1]).slice(0, 6);
+  const max = ranked.length ? ranked[0][1] : 1;
+  if (!ranked.length) {
+    return <div style={{ padding: '24px 0', textAlign: 'center', color: 'var(--fg-3)', fontSize: 13 }}>
+      No conflicts — every region clean.
+    </div>;
+  }
+  return (
+    <div className="dh-rank">
+      {ranked.map(([name, n], i) => (
+        <div key={name} className={`dh-rank-row ${i === 0 ? 'top' : ''}`}>
+          <span className="dh-rank-no">{i + 1}</span>
+          <span className="dh-rank-name">{name}</span>
+          <span className="dh-rank-bar"><span style={{ width: `${(n / max) * 100}%` }}/></span>
+          <span className="dh-rank-val">{n}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+
+function rollupByHour(points, replans) {
+  const byHour = new Map();
+  points.forEach(p => byHour.set(p.hourKey, { ...p, samples: (byHour.get(p.hourKey)?.samples || 0) + 1 }));
+  const changes = new Map();
+  replans.forEach(iso => {
+    const k = window.formatTime(iso, { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: undefined, hour12: false });
+    changes.set(k, (changes.get(k) || 0) + 1);
+  });
+  return [...byHour.values()].reverse().map(p => ({ ...p, changes: changes.get(p.hourKey) || 0 }));
+}
+
+function DhRollupTable({ history, replans }) {
+  const pts = rollupByHour(history.points, replans);
+  const clsPill = (n, kind) => (
+    <span className={`dh-cls-pill ${n > 0 ? kind : 'zero'}`}>{n}</span>
+  );
+  const healthColor = (pct) =>
+    pct >= 90 ? 'var(--ok)' : pct >= 75 ? 'var(--warn)' : 'var(--crit)';
+  return (
+    <div className="panel" style={{ padding: 0, overflow: 'hidden' }}>
+      <div className="panel-head" style={{ padding: 'var(--pad-panel)', paddingBottom: 12 }}>
+        <div className="titles">
+          <h3 className="panel-title">Hourly Rollup</h3>
+          <div className="panel-sub">Last sample of each hour · conflicts by class, PCI changes committed and conflict-free share</div>
+        </div>
+        <button className="btn-sm" onClick={() => window.exportConflictHistoryCSV()}>
+          <Icon name="download" size={12}/>Export CSV
+        </button>
+      </div>
+      <div style={{ overflow: 'auto', maxHeight: 440 }}>
+        <table className="dh-tbl">
+          <thead>
+            <tr>
+              <th>Hour</th>
+              <th>Samples</th>
+              <th>Collision</th>
+              <th>Confusion</th>
+              <th>Mod-N</th>
+              <th>Total</th>
+              <th>Changes</th>
+              <th style={{ textAlign: 'right' }}>Conflict-free</th>
+            </tr>
+          </thead>
+          <tbody>
+            {pts.map((p, i) => (
+              <tr key={i}>
+                <td>{p.hourLabel}</td>
+                <td style={{ color: 'var(--fg-3)' }}>{p.samples}</td>
+                <td>{clsPill(p.collision, 'collision')}</td>
+                <td>{clsPill(p.confusion, 'confusion')}</td>
+                <td>{clsPill(p.modn, 'modn')}</td>
+                <td style={{ color: 'var(--fg)', fontWeight: 600 }}>{p.total}</td>
+                <td>{p.changes > 0
+                  ? <span style={{ color: 'var(--info)' }}>+{p.changes}</span>
+                  : <span style={{ color: 'var(--fg-4)' }}>0</span>}</td>
+                <td style={{ textAlign: 'right' }}>
+                  <span className="dh-health-bar">
+                    <span style={{ width: `${p.healthPct}%`, background: healthColor(p.healthPct) }}/>
+                  </span>
+                  <span style={{ marginLeft: 8, color: 'var(--fg-2)' }}>{p.healthPct}%</span>
+                </td>
+              </tr>
+            ))}
+            {!pts.length && (
+              <tr><td colSpan={8} style={{ color: 'var(--fg-3)', textAlign: 'center', padding: 24 }}>
+                No samples yet — the first row appears about a minute after PM data is ingested.
+              </td></tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+
+window.exportConflictHistoryCSV = () => {
+  const h = window.buildConflictHistory(window.PCI_DATA.HISTORY);
+  const head = 'time_utc,collision,confusion,modn,total,conflict_free_pct';
+  const body = h.points.map(p =>
+    `${p.iso},${p.collision},${p.confusion},${p.modn},${p.total},${p.healthPct}`
+  ).join('\n');
+  const blob = new Blob([head + '\n' + body], { type: 'text/csv;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = `pci-conflict-history-${Date.now()}.csv`;
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+};
+
+
+const PLANNING_TABS = [
+  ['plan', 'Plan', 'Import a cell plan and compare the operator assignment against the optimised one'],
+  ['history', 'History', 'Conflict trend and hourly rollup since the dashboard started'],
+  ['activity', 'Activity', 'Logins, imports, re-plans and configuration changes'],
+];
+
+function PciPlanningView({ initialTab = 'plan', onTabChange }) {
+  const [tab, setTab] = React.useState(initialTab);
+  React.useEffect(() => { setTab(initialTab); }, [initialTab]);
+  const pick = (k) => { setTab(k); if (onTabChange) onTabChange(k); };
+  const meta = PLANNING_TABS.find(t => t[0] === tab) || PLANNING_TABS[0];
+
+  return (
+    <>
+      <SectionHead title="PCI Planning" subtitle={meta[2]}
+        actions={
+          <div className="seg">
+            {PLANNING_TABS.map(([k, label]) => (
+              <button key={k} data-on={tab === k ? 1 : undefined} onClick={() => pick(k)}>{label}</button>
+            ))}
+          </div>
+        }/>
+      {tab === 'plan' && <PlanView embedded/>}
+      {tab === 'history' && <DataHistoryView embedded/>}
+      {tab === 'activity' && <ActivityView/>}
+    </>
+  );
+}
+
+
+const ACT_SEV_CLASS = { critical: 'crit', major: 'warn', warning: 'warn', minor: 'info', info: 'info' };
+
+function ActivityView() {
+  const [logs, setLogs] = React.useState(null);
+  const [err, setErr] = React.useState(null);
+  const [filter, setFilter] = React.useState('all');
+
+  const load = React.useCallback(() => {
+    fetch('/api/audit?per_page=300')
+      .then(r => r.json())
+      .then(d => setLogs(d.logs || []))
+      .catch(e => setErr(String(e)));
+  }, []);
+  React.useEffect(() => {
+    load();
+    const id = setInterval(load, 15000);
+    return () => clearInterval(id);
+  }, [load]);
+
+  const shown = React.useMemo(() => {
+    if (!logs) return [];
+    if (filter === 'all') return logs;
+    if (filter === 'system') return logs.filter(l => l.source === 'system');
+    return logs.filter(l => l.source !== 'system');
+  }, [logs, filter]);
+  const who = (l) => l.actor ? `${l.actor.name}${l.actor.email ? ` · ${l.actor.email}` : ''}` : (l.source || 'system');
+
+  return (
+    <div className="panel act-panel">
+      <div className="panel-head">
+        <div className="titles">
+          <h3 className="panel-title">Activity</h3>
+          <div className="panel-sub">
+            {logs === null ? 'Loading…' : `${logs.length} event${logs.length === 1 ? '' : 's'} since the dashboard started · sign-ins, imports, re-plans and setting changes, each with who did it`}
+          </div>
+        </div>
+        <div className="row-h" style={{ gap: 10 }}>
+          <div className="seg sm">
+            {[['all','All'],['operator','Operator'],['system','System']].map(([k,l]) => (
+              <button key={k} data-on={filter === k ? 1 : undefined} onClick={() => setFilter(k)}>{l}</button>
+            ))}
+          </div>
+          <button className="btn-sm" onClick={load}><Icon name="refresh" size={12}/>Refresh</button>
+        </div>
+      </div>
+
+      {err && <div className="plan-empty-row">Could not load the activity log: {err}</div>}
+      {logs !== null && shown.length === 0 && (
+        <div className="plan-empty-row">
+          No events yet. Imports, re-plans and configuration changes appear here as they happen.
+        </div>
+      )}
+      <div className="act-list">
+        {shown.map(l => (
+          <div key={l.id} className={`act-row ${ACT_SEV_CLASS[l.severity] || 'info'}`}>
+            <span className="act-bar"/>
+            <div className="act-body">
+              <div className="act-top">
+                <span className="act-kind">{(l.event_type || '').replace(/_/g, ' ')}</span>
+                <span className="act-src" title={l.actor ? `${l.actor.role || ''}`.trim() : ''}>{who(l)}</span>
+                {l.cell_id && <span className="act-cell">{l.cell_id}</span>}
+                {l.pci_old !== null && l.pci_new !== null && (
+                  <span className="act-pci">PCI {l.pci_old} → {l.pci_new}</span>
+                )}
+              </div>
+              <div className="act-desc">{l.description}</div>
+            </div>
+            <span className="act-t" title={l.timestamp}>{window.formatTime(l.timestamp, { year: 'numeric', second: '2-digit', hour12: false })}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function DataHistoryView({ embedded }) {
+  const [, force] = React.useReducer(x => x + 1, 0);
+  const [replans, setReplans] = React.useState([]);
+  React.useEffect(() => {
+    if (window.subscribePCI) window.subscribePCI(() => force());
+    fetch('/api/audit?type=pci_replan&per_page=1000')
+      .then(r => r.json())
+      .then(d => setReplans((d.logs || []).map(l => l.timestamp).filter(Boolean)))
+      .catch(() => {});
+  }, []);
+  const history = window.buildConflictHistory(window.PCI_DATA.HISTORY);
+
+  return (
+    <>
+      {!embedded && (
+        <SectionHead title="Data History"
+          subtitle="PCI conflict and optimization trends across the network."
+          actions={
+            <button className="btn-sm" onClick={() => window.exportConflictHistoryCSV()}>
+              <Icon name="download" size={12}/>Export CSV
+            </button>
+          }/>
+      )}
+
+      <DhStatBand history={history} replans={replans}/>
+
+      <div className="panel">
+        <div className="panel-head">
+          <div className="titles">
+            <h3 className="panel-title">Worst-hit Regions</h3>
+            <div className="panel-sub">Ranked by active conflict count</div>
+          </div>
+        </div>
+        <DhWorstRegions/>
+      </div>
+
+      <DhRollupTable history={history} replans={replans}/>
+    </>
+  );
+}
+
+function PCIPlanPanel() {
+  const [uploads, setUploads] = React.useState([]);
+  const [selectedId, setSelectedId] = React.useState(null);
+  const [records, setRecords] = React.useState([]);
+  const [recTotal, setRecTotal] = React.useState(0);
+  const [busy, setBusy] = React.useState(false);
+  const [drag, setDrag] = React.useState(false);
+  const [flash, setFlash] = React.useState(null);
+  const [applyResult, setApplyResult] = React.useState(null);
+  const [filter, setFilter] = React.useState('all');
+  const [q, setQ] = React.useState('');
+  const fileRef = React.useRef(null);
+
+  const loadUploads = React.useCallback(async () => {
+    try {
+      const r = await fetch('/api/excel/uploads');
+      const j = await r.json();
+      const list = (Array.isArray(j) ? j : []).map(u => ({
+        ...u,
+        applied: !!u.applied_at,
+        uploaded_by: u.applied_by || u.uploaded_by || null,
+      }));
+      setUploads(list);
+      if (list.length && selectedId == null) setSelectedId(list[0].id);
+    } catch (e) {  }
+  }, [selectedId]);
+
+  const loadRecords = React.useCallback(async (id) => {
+    if (!id) { setRecords([]); setRecTotal(0); return; }
+    try {
+      const r = await fetch(`/api/excel/uploads/${id}/records?page=1&per_page=500`);
+      const j = await r.json();
+
+
+      const liveById = {};
+      (window.PCI_DATA?.CELLS || []).forEach(c => { liveById[c.id] = c; });
+      const PLANNING_FIELDS = [
+        'lat', 'lng', 'site_name', 'height_m', 'azimuth',
+        'mech_tilt', 'elec_tilt', 'antenna_model',
+        'antenna_gain_dbi', 'beamwidth_deg', 'tx_power_dbm',
+      ];
+      const enriched = (j.records || []).map(rec => {
+        const live = liveById[rec.cell_id];
+
+        const diffFields = [];
+        if (live) {
+          PLANNING_FIELDS.forEach(f => {
+            const newVal = rec[f];
+
+            const liveKey = f === 'site_name' ? 'site' : f;
+            const oldVal = live[liveKey];
+            if (newVal == null) return;
+            if (oldVal == null) { diffFields.push(f); return; }
+            if (typeof newVal === 'number') {
+              if (Math.abs(Number(oldVal) - newVal) > 1e-9) diffFields.push(f);
+            } else if (String(oldVal) !== String(newVal)) {
+              diffFields.push(f);
+            }
+          });
+        }
+        return {
+          ...rec,
+          live,
+          diffFields,
+          known_cell: !!live,
+
+          row_status: !rec.valid     ? 'error'
+                    : !live           ? 'unknown'
+                    : diffFields.length ? 'change'
+                                        : 'noop',
+        };
+      });
+      setRecords(enriched);
+      setRecTotal(j.total || 0);
+    } catch (e) {  }
+  }, []);
+
+  React.useEffect(() => { loadUploads(); }, []);
+  React.useEffect(() => { loadRecords(selectedId); setApplyResult(null); }, [selectedId, loadRecords]);
+
+  const showFlash = (kind, msg) => {
+    setFlash({ kind, msg });
+
+
+    const hold = kind === 'err' ? 10000 : 4500;
+    setTimeout(() => setFlash(null), hold);
+  };
+
+  const upload = async (file) => {
+    if (!file) return;
+    if (!/\.(xlsx|xls|csv)$/i.test(file.name)) { showFlash('err', 'Use .xlsx, .xls, or .csv'); return; }
+    setBusy(true);
+    try {
+      const fd = new FormData();
+      fd.append('file', file);
+      fd.append('description', 'Site & antenna config upload');
+      const r = await fetch('/api/excel/upload', { method: 'POST', body: fd });
+      const j = await r.json();
+      if (!r.ok || !j.ok) {
+
+
+        let msg = j.error || 'Upload failed';
+        if (Array.isArray(j.invalid_rows) && j.invalid_rows.length) {
+          const first = j.invalid_rows.slice(0, 3)
+            .map(ir => `row ${ir.row}: ${ir.reason}`)
+            .join(' · ');
+          msg += `  —  ${first}`;
+          if (j.invalid_rows.length < (j.invalid_count || 0)) {
+            msg += ` … (+${j.invalid_count - j.invalid_rows.length} more)`;
+          }
+        }
+        showFlash('err', msg);
+      } else {
+        showFlash('ok', `Stored ${j.rows} rows · review and apply to push to the live network.`);
+        await loadUploads();
+        setSelectedId(j.upload_id);
+      }
+    } catch (e) { showFlash('err', 'Network error: ' + (e.message || e)); }
+    finally { setBusy(false); }
+  };
+
+  const apply = async () => {
+    if (!selectedId) return;
+    setBusy(true); setApplyResult(null);
+    try {
+      const r = await fetch(`/api/excel/uploads/${selectedId}/apply`, { method: 'POST' });
+      const j = await r.json();
+      if (!r.ok || !j.ok) {
+        showFlash('err', j.error || 'Apply failed');
+      } else {
+        setApplyResult(j);
+        showFlash('ok',
+          `${j.applied_count} cell${j.applied_count === 1 ? '' : 's'} configured to the live network ` +
+          `· positions and antenna parameters updated`);
+
+
+        const appliedIds = (j.applied || []).map(a => a.cell_id).filter(Boolean);
+        if (appliedIds.length) {
+          window.dispatchEvent(new CustomEvent('pci-apply-zoom', {
+            detail: { cellIds: appliedIds },
+          }));
+        }
+      }
+    } catch (e) { showFlash('err', 'Network error: ' + (e.message || e)); }
+    finally { setBusy(false); }
+  };
+
+  const remove = async (id) => {
+    if (!confirm('Delete this PCI plan? Cells already changed are not reverted.')) return;
+    try {
+      await fetch(`/api/excel/uploads/${id}`, { method: 'DELETE' });
+      if (id === selectedId) setSelectedId(null);
+      await loadUploads();
+    } catch (e) {  }
+  };
+
+  const onDrop = (e) => {
+    e.preventDefault(); setDrag(false);
+    const f = e.dataTransfer.files && e.dataTransfer.files[0];
+    if (f) upload(f);
+  };
+
+  const selected = uploads.find(u => u.id === selectedId) || null;
+  const fmtTime = (iso) => (window.formatTime ? window.formatTime(iso) : iso);
+  const fmtRelative = (iso) => {
+    if (!iso) return '—';
+    try {
+      const d = new Date(/\dZ$|[+-]\d\d:?\d\d$/.test(iso) ? iso : iso + 'Z');
+      const diff = (Date.now() - d.getTime()) / 1000;
+      if (diff < 60)        return Math.round(diff) + 's ago';
+      if (diff < 3600)      return Math.round(diff / 60) + 'm ago';
+      if (diff < 3600 * 24) return Math.round(diff / 3600) + 'h ago';
+      return Math.round(diff / 86400) + 'd ago';
+    } catch (e) { return iso; }
+  };
+
+
+  const changedCount   = records.filter(r => r.row_status === 'change').length;
+  const unchangedCount = records.filter(r => r.row_status === 'noop').length;
+  const unknownCount   = records.filter(r => r.row_status === 'unknown').length;
+  const errorCount     = records.filter(r => r.row_status === 'error').length;
+
+  const totalFieldChanges = records.reduce(
+    (a, r) => a + (r.row_status === 'change' ? (r.diffFields?.length || 0) : 0), 0,
+  );
+
+  const filtered = React.useMemo(() => {
+    let rows = records;
+    if (q) {
+      const t = q.toLowerCase();
+      rows = rows.filter(r =>
+        (r.cell_id || '').toLowerCase().includes(t) ||
+        (r.site_name || '').toLowerCase().includes(t) ||
+        (r.live?.site || '').toLowerCase().includes(t) ||
+        String(r.lat ?? '').includes(t) ||
+        String(r.lng ?? '').includes(t)
+      );
+    }
+    if (filter === 'changed')   rows = rows.filter(r => r.row_status === 'change');
+    if (filter === 'unchanged') rows = rows.filter(r => r.row_status === 'noop');
+    if (filter === 'errors')    rows = rows.filter(r => r.row_status === 'error');
+    if (filter === 'unknown')   rows = rows.filter(r => r.row_status === 'unknown');
+    return rows;
+  }, [records, q, filter]);
+
+
+  const [showAntenna, setShowAntenna] = React.useState(false);
+
+
+  const fmtVal = (v, prec = 4) => {
+    if (v == null || v === '') return '—';
+    if (typeof v === 'number') return prec === 0 ? Math.round(v).toString() : v.toFixed(prec);
+    return String(v);
+  };
+  const diffCell = (r, field, prec = 4) => {
+    const newVal = r[field];
+    const liveKey = field === 'site_name' ? 'site' : field;
+    const oldVal = r.live ? r.live[liveKey] : null;
+    const changed = r.diffFields?.includes(field);
+    if (newVal == null) {
+
+      return <span style={{ color: 'var(--fg-3)', fontFamily: 'var(--font-mono)', fontSize: 11.5 }}>{fmtVal(oldVal, prec)}</span>;
+    }
+    if (changed) {
+      return (
+        <span style={{ display: 'inline-flex', gap: 5, alignItems: 'baseline', fontFamily: 'var(--font-mono)', fontSize: 11.5 }}>
+          <span style={{ color: 'var(--fg-3)' }}>{fmtVal(oldVal, prec)}</span>
+          <span style={{ color: 'var(--accent)' }}>→</span>
+          <span style={{ color: 'var(--accent)', fontWeight: 600 }}>{fmtVal(newVal, prec)}</span>
+        </span>
+      );
+    }
+    return <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11.5 }}>{fmtVal(newVal, prec)}</span>;
+  };
+
+  return (
+    <div className="panel ppl-wrap">
+      <div className="ppl-head">
+        <div className="titles">
+          <h3>Site &amp; Antenna Configuration</h3>
+          <p>Upload planning data the live gNB feed doesn't carry — coordinates, antenna parameters, site labels. Reviewed and applied on demand.</p>
+        </div>
+        <div className="ppl-head-actions">
+          <a className="btn-sm" href="/api/excel/template" download>
+            <Icon name="download" size={12}/>Template
+          </a>
+          <button className="btn-sm" onClick={() => fileRef.current && fileRef.current.click()} disabled={busy}>
+            <Icon name="plus" size={12}/>New Upload
+          </button>
+          <button className="btn-sm primary" onClick={apply} disabled={!selected || busy}>
+            <Icon name="arrowRt" size={12}/>Apply Config
+          </button>
+        </div>
+      </div>
+
+      <input ref={fileRef} type="file" accept=".xlsx,.xls,.csv" style={{ display: 'none' }}
+        onChange={(e) => { const f = e.target.files && e.target.files[0]; e.target.value = ''; upload(f); }}/>
+
+      <div className="ppl-summary">
+        <div className="ppl-summary-cell">
+          <div className="lbl"><span className="dot ok"/>Stored plans</div>
+          <div className="val big">{uploads.length}</div>
+          <div className="sub">{uploads.length === 1 ? 'plan' : 'plans'} committed to database</div>
+        </div>
+        <div className="ppl-summary-cell">
+          <div className="lbl"><span className="dot"/>Last upload</div>
+          <div className="val">{uploads[0] ? fmtRelative(uploads[0].upload_time) : '—'}</div>
+          <div className="sub">{uploads[0] ? `${uploads[0].row_count} rows · ${uploads[0].uploaded_by || 'unknown'}` : 'no uploads yet'}</div>
+        </div>
+        <div className="ppl-summary-cell">
+          <div className="lbl"><span className={`dot ${selected && !selected.applied ? 'warn' : 'ok'}`}/>Selected plan</div>
+          <div className="val" title={selected ? selected.filename : ''}>
+            {selected ? selected.filename.replace(/^\d{8}_\d{6}_/, '') : '—'}
+          </div>
+          <div className="sub">
+            {selected
+              ? <>{recTotal} rows · <span style={{ color: 'var(--accent)' }}>{changedCount} cell{changedCount === 1 ? '' : 's'} to update</span></>
+              : 'pick a plan to preview'}
+          </div>
+        </div>
+        <div className="ppl-summary-cell">
+          <div className="lbl"><span className="dot"/>Required schema</div>
+          <div className="val" style={{ fontSize: 13, color: 'var(--fg-2)' }}>cell_id · lat · lng · azimuth</div>
+          <div className="sub">+ 8 optional antenna fields · template available</div>
+        </div>
+      </div>
+
+      {flash && (
+        <div className={`ppl-flash ${flash.kind}`} role="status">
+          <Icon name={flash.kind === 'ok' ? 'check' : 'alert'} size={flash.kind === 'err' ? 18 : 14}/>
+          <span>{flash.msg}</span>
+        </div>
+      )}
+
+      <div className="ppl-body">
+        <aside className="ppl-side">
+          <div className={`ppl-dropzone ${drag ? 'drag' : ''}`}
+            onDragOver={(e) => { e.preventDefault(); setDrag(true); }}
+            onDragLeave={() => setDrag(false)}
+            onDrop={onDrop}
+            onClick={() => !busy && fileRef.current && fileRef.current.click()}>
+            <div className="ppl-dropzone-icon"><Icon name="upload" size={18}/></div>
+            <div className="ppl-dropzone-t1">Drop a plan file</div>
+            <div className="ppl-dropzone-t2">or <span className="lk">browse</span><br/>.xlsx · .xls · .csv</div>
+            {busy && <div className="ppl-dropzone-busy">uploading…</div>}
+          </div>
+
+          <div className="ppl-side-head">
+            <span className="t">Uploads</span>
+            <span className="count">{uploads.length}</span>
+          </div>
+
+          <div className="ppl-list">
+            {uploads.length === 0 && (
+              <div className="ppl-side-empty">No plans uploaded yet.</div>
+            )}
+            {uploads.map(u => {
+              const isSel = u.id === selectedId;
+              return (
+                <div key={u.id} className={`ppl-card ${isSel ? 'selected' : ''}`} onClick={() => setSelectedId(u.id)}>
+                  <div className="ico"><Icon name="file" size={14}/></div>
+                  <div className="meta">
+                    <div className="name" title={u.filename}>{u.filename.replace(/^\d{8}_\d{6}_/, '')}</div>
+                    <div className="info">
+                      <span>{u.row_count} rows</span>
+                      <span className="dot"/>
+                      <span>{fmtRelative(u.upload_time)}</span>
+                      <span className="dot"/>
+                      <span className={`badge ${u.applied ? 'applied' : 'pending'}`}>{u.applied ? 'applied' : 'pending'}</span>
+                    </div>
+                  </div>
+                  <button className="del" onClick={(e) => { e.stopPropagation(); remove(u.id); }} title="Delete plan">
+                    <Icon name="x" size={12}/>
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+        </aside>
+
+        <section className="ppl-main">
+          <div className="ppl-main-head">
+            <div>
+              <div className="t-title">
+                {selected ? <>Preview <span className="filename">· {selected.filename.replace(/^\d{8}_\d{6}_/, '')}</span></> : 'Preview'}
+              </div>
+              <div className="t-sub">
+                {selected
+                  ? <>Showing {filtered.length} of {records.length} rows · {changedCount} cell{changedCount === 1 ? '' : 's'} to update · {totalFieldChanges} field change{totalFieldChanges === 1 ? '' : 's'}{errorCount > 0 && <> · <span style={{ color: 'var(--crit)' }}>{errorCount} validation error{errorCount === 1 ? '' : 's'}</span></>}</>
+                  : 'Select an upload from the list to preview its rows'}
+              </div>
+            </div>
+          </div>
+
+          {selected && records.length > 0 && (
+            <div className="ppl-filters">
+              <div className="ppl-search">
+                <Icon name="search" size={12}/>
+                <input placeholder="Filter rows by cell, site, or coordinates…" value={q} onChange={(e) => setQ(e.target.value)}/>
+              </div>
+              <button className="ppl-chip" data-on={filter === 'all' ? '1' : '0'} onClick={() => setFilter('all')}>
+                All <span className="ct">{records.length}</span>
+              </button>
+              <button className="ppl-chip" data-on={filter === 'changed' ? '1' : '0'} onClick={() => setFilter('changed')}>
+                Changed <span className="ct">{changedCount}</span>
+              </button>
+              <button className="ppl-chip" data-on={filter === 'unchanged' ? '1' : '0'} onClick={() => setFilter('unchanged')}>
+                No-op <span className="ct">{unchangedCount}</span>
+              </button>
+              {unknownCount > 0 && (
+                <button className="ppl-chip" data-on={filter === 'unknown' ? '1' : '0'} onClick={() => setFilter('unknown')}>
+                  Unknown <span className="ct">{unknownCount}</span>
+                </button>
+              )}
+              {errorCount > 0 && (
+                <button className="ppl-chip" data-on={filter === 'errors' ? '1' : '0'} onClick={() => setFilter('errors')}>
+                  Errors <span className="ct">{errorCount}</span>
+                </button>
+              )}
+              <button className="ppl-chip" data-on={showAntenna ? '1' : '0'}
+                      onClick={() => setShowAntenna(v => !v)}
+                      title="Show antenna parameters in the table">
+                Antenna <Icon name={showAntenna ? 'check' : 'plus'} size={11}/>
+              </button>
+            </div>
+          )}
+
+          <div className="ppl-table-wrap">
+            {!selected && (
+              <div className="ppl-empty">
+                <div className="ppl-empty-ico"><Icon name="list" size={22}/></div>
+                <div className="t">No plan selected</div>
+                <div className="s">Upload a new sheet, or pick one from the sidebar to preview proposed PCI changes before applying.</div>
+              </div>
+            )}
+            {selected && records.length === 0 && (
+              <div className="ppl-empty">
+                <div className="ppl-empty-ico"><Icon name="file" size={22}/></div>
+                <div className="t">This plan is empty</div>
+                <div className="s">No data rows were parsed from the upload. Check that the sheet matches the template.</div>
+              </div>
+            )}
+            {selected && filtered.length === 0 && records.length > 0 && (
+              <div className="ppl-empty">
+                <div className="ppl-empty-ico"><Icon name="search" size={22}/></div>
+                <div className="t">No rows match the filter</div>
+                <div className="s">Try a different search term, or switch to a broader filter.</div>
+              </div>
+            )}
+            {selected && filtered.length > 0 && (
+              <table className="ppl-tbl">
+                <thead>
+                  <tr>
+                    <th style={{ width: 48 }}>Row</th>
+                    <th>Cell</th>
+                    <th style={{ width: 150 }}>Site</th>
+                    <th style={{ width: 130 }}>Latitude</th>
+                    <th style={{ width: 130 }}>Longitude</th>
+                    <th style={{ width: 90 }}>Height (m)</th>
+                    <th style={{ width: 90 }}>Azimuth</th>
+                    {showAntenna && <>
+                      <th style={{ width: 90 }}>Mech tilt</th>
+                      <th style={{ width: 90 }}>Elec tilt</th>
+                      <th style={{ width: 130 }}>Antenna model</th>
+                      <th style={{ width: 90 }}>Gain (dBi)</th>
+                      <th style={{ width: 100 }}>Beamwidth (°)</th>
+                      <th style={{ width: 100 }}>TX power (dBm)</th>
+                    </>}
+                  </tr>
+                </thead>
+                <tbody>
+                  {filtered.map(r => (
+                    <tr key={r.id} className={r.row_status === 'change' ? 'row-changed' : ''}>
+                      <td className="row-num">{r.row_num}</td>
+                      <td>
+                        <div className="cell-id">{r.cell_id || <span style={{ color: 'var(--fg-4)' }}>—</span>}</div>
+                        {r.live?.region && <div className="site">{r.live.region}</div>}
+                      </td>
+                      <td>{diffCell(r, 'site_name', 0)}</td>
+                      <td>{diffCell(r, 'lat', 4)}</td>
+                      <td>{diffCell(r, 'lng', 4)}</td>
+                      <td>{diffCell(r, 'height_m', 1)}</td>
+                      <td>{diffCell(r, 'azimuth', 0)}</td>
+                      {showAntenna && <>
+                        <td>{diffCell(r, 'mech_tilt', 1)}</td>
+                        <td>{diffCell(r, 'elec_tilt', 1)}</td>
+                        <td>{diffCell(r, 'antenna_model', 0)}</td>
+                        <td>{diffCell(r, 'antenna_gain_dbi', 1)}</td>
+                        <td>{diffCell(r, 'beamwidth_deg', 0)}</td>
+                        <td>{diffCell(r, 'tx_power_dbm', 1)}</td>
+                      </>}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </div>
+
+          {selected && records.length > 0 && (
+            <div className="ppl-foot">
+              <div className="ppl-foot-stat change">
+                <span className="n">{changedCount}</span>
+                <span className="l">cells to update</span>
+              </div>
+              <div className="ppl-foot-divider"/>
+              <div className="ppl-foot-stat">
+                <span className="n">{totalFieldChanges}</span>
+                <span className="l">field changes</span>
+              </div>
+              <div className="ppl-foot-divider"/>
+              <div className="ppl-foot-stat">
+                <span className="n">{unchangedCount}</span>
+                <span className="l">no-op</span>
+              </div>
+              {unknownCount > 0 && <>
+                <div className="ppl-foot-divider"/>
+                <div className="ppl-foot-stat error">
+                  <span className="n">{unknownCount}</span>
+                  <span className="l">unknown cells</span>
+                </div>
+              </>}
+              {errorCount > 0 && <>
+                <div className="ppl-foot-divider"/>
+                <div className="ppl-foot-stat error">
+                  <span className="n">{errorCount}</span>
+                  <span className="l">errors</span>
+                </div>
+              </>}
+              <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 12 }}>
+                {applyResult ? (
+                  <span style={{ color: 'var(--ok)', fontFamily: 'var(--font-mono)', fontSize: 12 }}>
+                    ✓ {applyResult.applied_count} cell{applyResult.applied_count === 1 ? '' : 's'} configured to the live network
+                    {applyResult.skipped_count ? ` · ${applyResult.skipped_count} skipped` : ''}
+                  </span>
+                ) : (
+                  <span style={{ color: 'var(--fg-3)', fontFamily: 'var(--font-mono)', fontSize: 11.5 }}>
+                    Ready · click <b style={{ color: 'var(--fg-2)' }}>Apply Config</b> to push to live network
+                  </span>
+                )}
+              </div>
+            </div>
+          )}
+
+          {applyResult && (applyResult.skipped_count > 0 || (applyResult.skipped && applyResult.skipped.length > 0)) && (
+            <div style={{ padding: '0 22px 16px' }}>
+              <div className="ppl-skipped">
+                {(applyResult.skipped || []).map((s, i) => (
+                  <div key={i}>
+                    <span className="r">#{s.row}</span>
+                    <span className="c">{s.cell_id || '—'}</span>
+                    <span className="why">{s.reason}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </section>
+      </div>
+    </div>
+  );
+}
+
