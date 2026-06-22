@@ -2375,3 +2375,515 @@ function PCIPlanPanel() {
   );
 }
 
+function PciReplanHistoryPanel() {
+  const [replans, setReplans] = React.useState([]);
+  const [loading, setLoading] = React.useState(true);
+
+  const load = React.useCallback(async () => {
+    try {
+      const r = await fetch('/api/audit?per_page=200');
+      const j = await r.json();
+      const logs = (j.logs || []).filter(l =>
+        l.pci_old != null && l.pci_new != null && l.pci_old !== l.pci_new
+      );
+      setReplans(logs.slice(0, 10));
+    } catch (e) {  }
+    setLoading(false);
+  }, []);
+
+  React.useEffect(() => {
+    load();
+
+    if (window.subscribePCI) window.subscribePCI(() => load());
+  }, [load]);
+
+  const fmtTime = (iso) => window.formatTime
+    ? window.formatTime(iso, { hour: '2-digit', minute: '2-digit', second: '2-digit', month: undefined, day: undefined })
+    : (iso || '').slice(11, 19);
+
+  const sourceLabel = (src) => {
+    if (!src) return 'system';
+    if (src === 'auto_detect' || src === 'auto-rapp' || src === 'system') return 'auto-rApp';
+    if (src === 'operator') return 'operator';
+    return src;
+  };
+  const sourceColor = (src) => {
+    const lbl = sourceLabel(src);
+    if (lbl === 'auto-rApp') return 'var(--accent)';
+    if (lbl === 'operator') return 'var(--info)';
+    return 'var(--fg-3)';
+  };
+
+  return (
+    <div className="panel">
+      <div className="panel-head">
+        <div className="titles">
+          <h3 className="panel-title">PCI Re-plan History</h3>
+          <div className="panel-sub">{replans.length === 0 ? 'No PCI swaps yet' : `${replans.length} recent swap${replans.length === 1 ? '' : 's'}`}</div>
+        </div>
+        <button className="btn-sm" onClick={load} title="Refresh">
+          <Icon name="refresh" size={12}/>
+        </button>
+      </div>
+      {loading && replans.length === 0 && (
+        <div style={{ padding: '14px 0', color: 'var(--fg-3)', fontSize: 13 }}>Loading…</div>
+      )}
+      {!loading && replans.length === 0 && (
+        <div style={{ padding: '20px 0', textAlign: 'center', color: 'var(--fg-3)', fontSize: 13 }}>
+          <Icon name="activity" size={22} style={{ opacity: 0.4, marginBottom: 6 }}/>
+          <div>No PCI re-plans logged.</div>
+          <div style={{ fontSize: 11.5, marginTop: 4 }}>Re-plan a cell from the Cell Map to populate this list.</div>
+        </div>
+      )}
+      {replans.map(l => (
+        <div key={l.id} className="row-h" style={{ justifyContent: 'space-between', padding: '10px 0', borderBottom: '1px dashed var(--line)', gap: 10 }}>
+          <span style={{ minWidth: 0, flex: 1 }}>
+            <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, fontSize: 13 }}>
+              <span className="mono" style={{ color: 'var(--fg)', fontWeight: 600 }}>{l.cell_id || '—'}</span>
+              <span className="mono" style={{ color: 'var(--fg-3)', fontSize: 12 }}>
+                PCI <span style={{ color: 'var(--fg-2)' }}>{l.pci_old}</span>
+                <span style={{ margin: '0 4px' }}>→</span>
+                <span style={{ color: 'var(--accent)' }}>{l.pci_new}</span>
+              </span>
+            </div>
+            <div style={{ fontSize: 11.5, color: 'var(--fg-3)', marginTop: 3 }}>{fmtTime(l.timestamp)}</div>
+          </span>
+          <span className="mono" style={{
+            fontSize: 11, padding: '3px 8px', borderRadius: 999,
+            color: sourceColor(l.source),
+            background: `color-mix(in oklch, ${sourceColor(l.source)} 12%, transparent)`,
+            border: `1px solid color-mix(in oklch, ${sourceColor(l.source)} 30%, transparent)`,
+            textTransform: 'uppercase', letterSpacing: '0.04em',
+            whiteSpace: 'nowrap', flex: '0 0 auto',
+          }}>{sourceLabel(l.source)}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+const SETTINGS_DEFAULTS = {
+  prb_warning: '80',
+
+  theme_mode: 'light',
+
+  account_name: 'Operator',
+  account_timezone: 'Asia/Kolkata',
+
+  notif_desktop: 'on',
+  notif_sound_critical: 'on',
+  notif_sound_minor: 'off',
+  notif_quiet_start: '',
+  notif_quiet_end: '',
+};
+
+
+const SETTINGS_SECTIONS = [
+  { id: 'thresholds',  icon: 'activity', label: 'Thresholds',    title: 'Thresholds & Detection',   sub: 'When the incident feed raises a congestion alert' },
+  { id: 'appearance',  icon: 'sun',      label: 'Appearance',    title: 'Theme & Appearance',       sub: 'Visual treatment applied across the dashboard' },
+  { id: 'account',     icon: 'settings', label: 'Account',       title: 'Account & Profile',        sub: 'Identity recorded in the activity log' },
+  { id: 'notifications', icon: 'bell',   label: 'Notifications', title: 'Notifications & Sounds',   sub: 'Alert delivery, sound and quiet hours' },
+];
+
+
+function SettingsView({ setTheme }) {
+  const [s, setS] = React.useState(() => ({ ...SETTINGS_DEFAULTS, ...(window.PCI_SETTINGS || {}) }));
+  const savedRef = React.useRef(s);
+  const [dirty, setDirty] = React.useState(false);
+  const [saving, setSaving] = React.useState(false);
+  const [savedAt, setSavedAt] = React.useState(null);
+  const [err, setErr] = React.useState(null);
+  const [activeSection, setActiveSection] = React.useState(SETTINGS_SECTIONS[0].id);
+  const sectionRefs = React.useRef({});
+
+
+  React.useEffect(() => {
+    fetch('/api/settings')
+      .then(r => r.json())
+      .then(remote => {
+        const next = { ...SETTINGS_DEFAULTS };
+        Object.keys(SETTINGS_DEFAULTS).forEach(k => { if (remote[k] != null) next[k] = remote[k]; });
+        savedRef.current = next;
+        setS(next);
+      })
+      .catch(() => {  });
+  }, []);
+
+
+  React.useEffect(() => {
+    const obs = new IntersectionObserver((entries) => {
+      const visible = entries.filter(e => e.isIntersecting)
+        .sort((a, b) => b.intersectionRatio - a.intersectionRatio);
+      if (visible[0]) setActiveSection(visible[0].target.id);
+    }, { rootMargin: '-100px 0px -55% 0px', threshold: [0.1, 0.5, 1] });
+    SETTINGS_SECTIONS.forEach(sec => {
+      const el = sectionRefs.current[sec.id];
+      if (el) obs.observe(el);
+    });
+    return () => obs.disconnect();
+  }, []);
+
+  const update = (key, val) => { setS(p => ({ ...p, [key]: val })); setDirty(true); };
+
+  const save = async () => {
+    setSaving(true); setErr(null);
+    try {
+      const body = {};
+      Object.keys(SETTINGS_DEFAULTS).forEach(k => { body[k] = s[k]; });
+      const r = await fetch('/api/settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      savedRef.current = { ...s };
+      if (window.applySettings) window.applySettings(body);
+      window.reloadPciData && window.reloadPciData(undefined, { quiet: true });
+      if (typeof setTheme === 'function') setTheme(s.theme_mode);
+      setDirty(false);
+      setSavedAt(new Date().toLocaleTimeString('en-GB', {
+        timeZone: (window.PCI_SETTINGS || {}).account_timezone || undefined,
+        hour12: false,
+      }));
+    } catch (e) { setErr(e.message || 'Failed to save'); }
+    setSaving(false);
+  };
+
+  const reset = () => { setS(savedRef.current); setDirty(false); };
+
+  const scrollTo = (id) => {
+    const el = sectionRefs.current[id];
+    if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    setActiveSection(id);
+  };
+
+
+  const Switch = ({ value, onChange }) => (
+    <button className="stg-switch" data-on={value === 'on' ? 1 : 0} aria-pressed={value === 'on'}
+      onClick={() => onChange(value === 'on' ? 'off' : 'on')}/>
+  );
+  const Seg = ({ value, options, onChange }) => (
+    <span className="stg-seg">
+      {options.map(([k, label]) => (
+        <button key={k} data-on={value === k ? 1 : 0} onClick={() => onChange(k)}>{label}</button>
+      ))}
+    </span>
+  );
+  const Row = ({ label, hint, stack, children }) => (
+    <div className={`stg-row ${stack ? 'stg-row-stack' : ''}`}>
+      <div className="stg-row-label">
+        <span className="l">{label}</span>
+        {hint && <span className="h">{hint}</span>}
+      </div>
+      <div className="stg-row-control">{children}</div>
+    </div>
+  );
+
+
+  const initials = (s.account_name || 'M M').split(/\s+/).map(w => w[0]).slice(0, 2).join('').toUpperCase();
+
+  const renderSection = (id) => {
+    switch (id) {
+      case 'thresholds': return (
+        <>
+          <Row label="PRB congestion warning" hint="A cell above this DL PRB utilisation raises a PRB Congestion incident (major at +10 points).">
+            <input className="stg-input" type="number" min="1" max="100" step="1" style={{ width: 90 }}
+              value={s.prb_warning}
+              onChange={(e) => update('prb_warning', e.target.value)}/>
+            <span className="stg-unit">%</span>
+          </Row>
+          <Row label="PCI conflicts" hint="Collision, confusion and mod-N detection follow the rApp config (configs/config.yaml → scoring, shadow_nrt); they are not toggled per user.">
+            <span style={{ fontSize: 13, color: 'var(--fg-3)' }}>always on</span>
+          </Row>
+        </>
+      );
+
+      case 'appearance': return (
+        <>
+          <Row label="Theme mode" hint="Light is best for daytime ops, dark suits NOC walls and overnight shifts.">
+            <Seg value={s.theme_mode}
+              options={[['light','Light'],['dark','Dark']]}
+              onChange={(v) => update('theme_mode', v)}/>
+          </Row>
+        </>
+      );
+
+      case 'account': return (
+        <>
+          <div style={{ padding: '14px 24px 0' }}>
+            <div className="stg-profile-card">
+              <div className="stg-profile-avatar">{initials}</div>
+              <div className="stg-profile-meta">
+                <div className="n">{s.account_name || '—'}</div>
+              </div>
+            </div>
+          </div>
+          <Row label="Display name" hint="Recorded as the actor on every sign-in, re-plan, import and settings change in the activity log." stack>
+            <input className="stg-input text" value={s.account_name}
+              onChange={(e) => update('account_name', e.target.value)}/>
+          </Row>
+          <Row label="Timezone" hint="Timestamps and quiet hours are shown in this zone.">
+            <select className="stg-select" value={s.account_timezone}
+              onChange={(e) => update('account_timezone', e.target.value)}>
+              <option value="Asia/Kolkata">Asia/Kolkata (IST)</option>
+              <option value="Asia/Singapore">Asia/Singapore (SGT)</option>
+              <option value="Europe/London">Europe/London (GMT)</option>
+              <option value="Europe/Berlin">Europe/Berlin (CET)</option>
+              <option value="America/New_York">America/New_York (EST)</option>
+              <option value="UTC">UTC</option>
+            </select>
+          </Row>
+        </>
+      );
+
+      case 'notifications': return (
+        <>
+          <Row label="Desktop notifications" hint="Browser pop-up notifications for new critical and major alerts.">
+            <Switch value={s.notif_desktop} onChange={(v) => update('notif_desktop', v)}/>
+          </Row>
+          <Row label="Sound on critical" hint="Two-tone audio cue when a critical alert fires.">
+            <Switch value={s.notif_sound_critical} onChange={(v) => update('notif_sound_critical', v)}/>
+          </Row>
+          <Row label="Sound on minor" hint="Single chime for minor / informational alerts.">
+            <Switch value={s.notif_sound_minor} onChange={(v) => update('notif_sound_minor', v)}/>
+          </Row>
+          <Row label="Quiet hours" hint="Suppress sound and desktop popups during this window. Critical alerts still surface in-app.">
+            <input className="stg-input stg-input-time" type="time" value={s.notif_quiet_start}
+              onChange={(e) => update('notif_quiet_start', e.target.value)}/>
+            <span className="stg-unit" style={{ padding: '0 4px' }}>to</span>
+            <input className="stg-input stg-input-time" type="time" value={s.notif_quiet_end}
+              onChange={(e) => update('notif_quiet_end', e.target.value)}/>
+          </Row>
+        </>
+      );
+
+      default: return null;
+    }
+  };
+
+  const savebarMsg = (() => {
+    if (err)   return { cls: 'err',   text: <>Failed to save · <b>{err}</b></> };
+    if (saving) return { cls: 'dirty', text: <>Saving changes…</> };
+    if (dirty) return { cls: 'dirty', text: <><b>Unsaved changes</b> · review and click <b>Save</b> to apply across the dashboard.</> };
+    return { cls: '', text: 'All changes are applied automatically when you save.' };
+  })();
+
+  return (
+    <>
+      <SectionHead title="Settings" subtitle={navSub('settings')}/>
+
+      <div className="stg-shell">
+        <aside className="stg-nav">
+          <div className="stg-nav-head">Sections</div>
+          {SETTINGS_SECTIONS.map(sec => (
+            <button key={sec.id} className="stg-nav-item" data-on={activeSection === sec.id ? 1 : 0}
+              onClick={() => scrollTo(sec.id)}>
+              <Icon name={sec.icon} size={15} className="ico"/>
+              <span>{sec.label}</span>
+            </button>
+          ))}
+        </aside>
+
+        <div className="stg-content">
+          {SETTINGS_SECTIONS.map(sec => (
+            <section key={sec.id} id={sec.id} className="stg-section"
+              ref={(el) => { sectionRefs.current[sec.id] = el; }}>
+              <div className="stg-section-head">
+                <div className="stg-section-ico"><Icon name={sec.icon} size={18}/></div>
+                <div className="stg-section-titles">
+                  <h3>{sec.title}</h3>
+                  <p>{sec.sub}</p>
+                </div>
+              </div>
+              {renderSection(sec.id)}
+            </section>
+          ))}
+
+          <div className={`stg-savebar ${dirty || err ? '' : 'idle'}`}>
+            <div className={`stg-savebar-msg ${savebarMsg.cls}`}>{savebarMsg.text}</div>
+            <button className="btn-sm" onClick={reset} disabled={saving || !dirty}>Discard</button>
+            <button className="btn-sm primary" onClick={save} disabled={!dirty || saving}>
+              {saving ? 'Saving…' : (dirty ? 'Save changes' : 'Saved')}
+            </button>
+          </div>
+        </div>
+      </div>
+    </>
+  );
+}
+
+
+function App() {
+  const [theme, setTheme] = useTheme();
+  const [section, setSection] = React.useState('overview');
+
+  const [planningTab, setPlanningTab] = React.useState('plan');
+  const [selectedCell, setSelectedCell] = React.useState(null);
+  const [notifOpen, setNotifOpen] = React.useState(false);
+  const settings = useSettings();
+
+
+  const [, setTick] = React.useState(0);
+  React.useEffect(() => {
+    if (window.subscribePCI) window.subscribePCI(() => setTick(n => n + 1));
+  }, []);
+
+
+  React.useEffect(() => {
+    const onApplyZoom = () => {
+      setSection('cell-map');
+      setSelectedCell(null);
+      window.scrollTo({ top: 0 });
+    };
+    window.addEventListener('pci-apply-zoom', onApplyZoom);
+    return () => window.removeEventListener('pci-apply-zoom', onApplyZoom);
+  }, []);
+
+
+  const seenAlertIds = React.useRef(new Set());
+  const audioCtxRef = React.useRef(null);
+  React.useEffect(() => {
+
+    const init = window.PCI_DATA?.ALERTS || [];
+    init.forEach(a => seenAlertIds.current.add(a.id));
+
+    if (window.subscribeSettings) {
+      window.subscribeSettings((s) => {
+        if (s.notif_desktop === 'on' && typeof Notification !== 'undefined' && Notification.permission === 'default') {
+          Notification.requestPermission().catch(() => {});
+        }
+      });
+    }
+    if (!window.subscribePCI) return;
+    window.subscribePCI((state) => {
+      const alerts = state.ALERTS || window.PCI_DATA?.ALERTS || [];
+      const s = window.PCI_SETTINGS || {};
+
+      const inQuietHours = (() => {
+        const qs = s.notif_quiet_start, qe = s.notif_quiet_end;
+        if (!qs || !qe) return false;
+        const tz = s.account_timezone || undefined;
+        const nowStr = new Date().toLocaleString('en-GB', { timeZone: tz, hour: '2-digit', minute: '2-digit', hour12: false });
+        const cur = nowStr;
+        return qs <= qe ? (cur >= qs && cur < qe) : (cur >= qs || cur < qe);
+      })();
+      const quiet = !!window.__PCI_QUIET_INGEST;
+      alerts.forEach(a => {
+        if (seenAlertIds.current.has(a.id)) return;
+        seenAlertIds.current.add(a.id);
+        if (inQuietHours || quiet) return;
+        const isCritical = a.sev === 'critical' || a.sev === 'major';
+        const isMinor = a.sev === 'minor' || a.sev === 'info';
+
+        if (isCritical && s.notif_desktop === 'on' && typeof Notification !== 'undefined' && Notification.permission === 'granted') {
+          try {
+            new Notification(`${a.sev?.toUpperCase() || 'ALERT'} · ${a.kind || 'PCI rApp'}${a.cell && a.cell !== '—' ? ` · ${a.cell}` : ''}`, {
+              body: a.msg || 'New alert',
+              tag: a.id,
+              silent: true,
+            });
+          } catch (e) {  }
+        }
+
+        const playBeep = (freq, durMs) => {
+          try {
+            if (!audioCtxRef.current) {
+              const Ctx = window.AudioContext || window.webkitAudioContext;
+              if (!Ctx) return;
+              audioCtxRef.current = new Ctx();
+            }
+            const ctx = audioCtxRef.current;
+            const osc = ctx.createOscillator();
+            const gain = ctx.createGain();
+            osc.type = 'sine';
+            osc.frequency.value = freq;
+            gain.gain.setValueAtTime(0.0001, ctx.currentTime);
+            gain.gain.exponentialRampToValueAtTime(0.18, ctx.currentTime + 0.02);
+            gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + durMs / 1000);
+            osc.connect(gain).connect(ctx.destination);
+            osc.start();
+            osc.stop(ctx.currentTime + durMs / 1000 + 0.02);
+          } catch (e) {  }
+        };
+        if (isCritical && s.notif_sound_critical === 'on') { playBeep(880, 220); setTimeout(() => playBeep(660, 220), 260); }
+        else if (isMinor && s.notif_sound_minor === 'on')  { playBeep(540, 180); }
+      });
+    });
+  }, []);
+
+
+  const _settingsSynced = React.useRef(false);
+  React.useEffect(() => {
+    if (!settings || !settings.theme_mode || _settingsSynced.current) return;
+    _settingsSynced.current = true;
+    let persisted = null;
+    try { persisted = localStorage.getItem('pci-theme'); } catch (e) {}
+    if (!persisted && settings.theme_mode !== theme) setTheme(settings.theme_mode);
+  }, [settings.theme_mode]);
+
+  React.useEffect(() => {
+    const html = document.documentElement;
+    [...html.classList].forEach(c => { if (c.startsWith('theme-')) html.classList.remove(c); });
+    html.classList.add('theme-' + theme);
+  }, [theme]);
+
+  const rootCls = `app theme-${theme}`;
+  const current = NAV.find(n => n.k === section) || NAV[0];
+
+  return (
+    <div className={rootCls}>
+      <Sidebar
+        active={section}
+        onSelect={(k) => { setSection(k); setSelectedCell(null); window.scrollTo({ top: 0 }); }}
+        onOpenNotifications={() => setNotifOpen(true)}
+      />
+
+      <div style={{ display: 'flex', flexDirection: 'column', minWidth: 0 }}>
+        <TopBar
+          theme={theme}
+          sectionTitle={current.title}
+          onToggleTheme={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
+          onSelectCell={setSelectedCell}
+          onNavigate={(k) => { setSection(k); setSelectedCell(null); window.scrollTo({ top: 0 }); }}
+        />
+
+        <main className="main">
+          {section === 'overview'     && <OverviewView    onSelectCell={setSelectedCell} selectedCell={selectedCell} onNavigate={(k) => { setSection(k); setSelectedCell(null); window.scrollTo({ top: 0 }); }}/>}
+          {section === 'cell-map'     && <CellMapView     onSelectCell={setSelectedCell} selectedCell={selectedCell}/>}
+          {section === 'pci-planning' && <PciPlanningView initialTab={planningTab} onTabChange={setPlanningTab}/>}
+          {section === 'settings'     && <SettingsView    setTheme={setTheme}/>}
+          {settings.brand_footer && (
+            <div style={{ marginTop: 32, padding: '14px 0', borderTop: '1px solid var(--bd)', color: 'var(--fg-3)', fontSize: 12, textAlign: 'center', letterSpacing: '0.02em' }}>
+              {settings.brand_footer}
+            </div>
+          )}
+        </main>
+      </div>
+
+      <DrilldownDrawer
+        cell={selectedCell}
+        onClose={() => setSelectedCell(null)}
+        onShowOnMap={(c) => {
+          if (!c || !c.id) return;
+          window.dispatchEvent(new CustomEvent('pci-apply-zoom', { detail: { cellIds: [c.id] } }));
+        }}
+      />
+      <NotificationsDrawer
+        open={notifOpen}
+        onClose={() => setNotifOpen(false)}
+        onJumpToAudit={() => { setPlanningTab('activity'); setSection('pci-planning'); window.scrollTo({ top: 0 }); }}
+      />
+
+    </div>
+  );
+}
+
+
+function __mountPciApp() {
+  ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+}
+if (window.__PCI_BOOT && window.__PCI_BOOT.then) {
+  window.__PCI_BOOT.then(__mountPciApp).catch(__mountPciApp);
+} else {
+  __mountPciApp();
+}
