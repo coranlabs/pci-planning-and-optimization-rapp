@@ -1,0 +1,59 @@
+# Copyright 2025-2026 coRAN LABS Private Limited
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+image:
+  registry: localhost:5000
+  name: pci-planning-rapp
+  tag: "2.1.0"
+  pullPolicy: IfNotPresent
+
+admin:
+  username: operator
+  password: "REPLACE_WITH_OPERATOR_PASSWORD"
+
+service:
+  port: 8080
+  nodePort: 30090
+
+kafka:
+  username: pci-planning-rapp
+  password: "REPLACE_WITH_KAFKA_SASL_PASSWORD"
+
+sdnr:
+  enabled: true
+  baseUrl: http://sdnc.onap.svc.cluster.local:8282
+  username: "REPLACE_WITH_SDNR_USERNAME"
+  password: "REPLACE_WITH_SDNR_PASSWORD"
+  nodeId: ""
+
+sftp:
+  knownHosts: ""
+
+influxdb2:
+  fullnameOverride: pci-planning-rapp-influxdb
+  service:
+    port: 8086
+    targetPort: 8086
+  adminUser:
+    organization: "pci-rapp"
+    bucket: "pci_planning_and_optimization"
+    user: "admin"
+    existingSecret: "pci-planning-rapp-influxdb-auth"
+  persistence:
+    enabled: true
+    size: 5Gi
+
+influxdb-credentials:
+  adminPassword: "REPLACE_WITH_INFLUX_ADMIN_PASSWORD"
+  adminToken: "REPLACE_WITH_INFLUX_ADMIN_TOKEN"
