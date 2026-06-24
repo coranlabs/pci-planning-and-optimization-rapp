@@ -1,0 +1,102 @@
+# Copyright 2025-2026 coRAN LABS Private Limited
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pci-planning-rapp
+  labels:
+    app: pci-planning-rapp
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pci-planning-rapp
+  template:
+    metadata:
+      labels:
+        app: pci-planning-rapp
+    spec:
+      containers:
+        - name: pci-planning-rapp
+          image: "{{ .Values.image.registry }}/{{ .Values.image.name }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.port }}
+          env:
+            - name: RAPP_ADMIN_USERNAME
+              value: {{ .Values.admin.username | quote }}
+            - name: RAPP_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: pci-planning-rapp-secrets
+                  key: admin-password
+            - name: KAFKA_USERNAME
+              value: {{ .Values.kafka.username | quote }}
+            - name: KAFKA_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: pci-planning-rapp-secrets
+                  key: kafka-password
+{{- if .Values.sftp.knownHosts }}
+            - name: RAPP_SSH_KNOWN_HOSTS
+              value: /etc/rapp-ssh/known_hosts
+{{- end }}
+            - name: SDNR_ENABLED
+              value: {{ .Values.sdnr.enabled | quote }}
+            - name: SDNR_BASE_URL
+              value: {{ .Values.sdnr.baseUrl | quote }}
+            - name: SDNR_USERNAME
+              value: {{ .Values.sdnr.username | quote }}
+            - name: SDNR_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: pci-planning-rapp-secrets
+                  key: sdnr-password
+            - name: SDNR_NETCONF_NODE_ID
+              value: {{ .Values.sdnr.nodeId | quote }}
+            - name: INFLUX_ENABLED
+              value: "true"
+            - name: INFLUX_URL
+              value: "http://{{ index .Values "influxdb2" "fullnameOverride" }}:8086"
+            - name: INFLUX_ORG
+              value: {{ index .Values "influxdb2" "adminUser" "organization" | quote }}
+            - name: INFLUX_BUCKET
+              value: {{ index .Values "influxdb2" "adminUser" "bucket" | quote }}
+            - name: INFLUX_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: pci-planning-rapp-influxdb-auth
+                  key: admin-token
+          startupProbe:
+            httpGet: {path: /startupz, port: http}
+            periodSeconds: 5
+            failureThreshold: 30
+          readinessProbe:
+            httpGet: {path: /readyz, port: http}
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 30
+{{- if .Values.sftp.knownHosts }}
+          volumeMounts:
+            - name: rapp-ssh
+              mountPath: /etc/rapp-ssh
+              readOnly: true
+      volumes:
+        - name: rapp-ssh
+          configMap:
+            name: pci-planning-rapp-known-hosts
+{{- end }}
