@@ -1,0 +1,5 @@
+TOSCA-Meta-File-Version: 1.0
+CSAR-Version: 1.1
+Created-By: PCI Planning and Optimization rApp
+Entry-Definitions: ASD.yaml
+Entry-Manifest: pci-planning-rapp.mf

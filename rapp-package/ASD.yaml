@@ -1,0 +1,87 @@
+# Copyright 2025-2026 coRAN LABS Private Limited
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+tosca_definitions_version: tosca_simple_yaml_1_3
+
+metadata:
+  template_name: PciPlanningRapp-ASD
+  template_author: coRAN Labs
+  template_version: 2.1.0
+
+description: TOSCA-based Application Service Descriptor for the PCI Planning and Optimization rApp
+
+topology_template:
+  node_templates:
+    applicationServiceDescriptor:
+      type: tosca.nodes.asd
+      properties:
+        descriptor_id: pci-planning-rapp-v1
+        descriptor_invariant_id: 892b844e-ca06-4054-a594-f1d812a87466
+        descriptor_version: 2.1.0
+        provider: coRAN Labs
+        application_name: PCI Planning and Optimization
+        application_version: 2.1.0
+        application_description: >
+          PCI Planning and Optimization rApp. Ingests 3GPP PM data announced
+          via VES notifyFileReady on Kafka, correlates handover failures with
+          PCI conflicts, detects mod3/mod30 collisions and confusions, and
+          computes conservative graph-coloring PCI change recommendations with
+          an operator approval workflow. Actuates approved changes over O1 via
+          SDNR and serves a dashboard plus planning APIs. Deployed via ACM
+          (Kubernetes Helm) and publishes its APIs via SME/CAPIF.
+
+        deploymentItems:
+          - artifactId: pci-planning-helm-chart
+            deploymentOrder: 0
+            artifactType: HELM
+            artifactLocation: Artifacts/Deployment/HELM/pci-planning-rapp
+
+        acmCompositionDefinitionFile: Files/Acm/definition/compositions.json
+        acmCompositionInstanceFile: Files/Acm/instances/pciplanning-instance.json
+
+node_types:
+  tosca.nodes.asd:
+    derived_from: tosca.nodes.Root
+    description: O-RAN Application Service Descriptor node type for rApp Manager
+    properties:
+      descriptor_id:
+        type: string
+        required: true
+      descriptor_invariant_id:
+        type: string
+        required: true
+      descriptor_version:
+        type: string
+        required: true
+      provider:
+        type: string
+        required: true
+      application_name:
+        type: string
+        required: true
+      application_version:
+        type: string
+        required: true
+      application_description:
+        type: string
+        required: false
+      deploymentItems:
+        type: list
+        required: true
+      acmCompositionDefinitionFile:
+        type: string
+        required: false
+      acmCompositionInstanceFile:
+        type: string
+        required: false
