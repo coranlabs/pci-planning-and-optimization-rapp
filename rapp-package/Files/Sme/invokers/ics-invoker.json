@@ -1,0 +1,17 @@
+[
+  {
+    "apiInvokerInformation": "DO_NOT_CHANGE_THIS_RAPP_INSTANCE_ID",
+    "apiList": [
+      {
+        "apiName": "ics-info-type-management",
+        "description": "ICS Information Type Management API"
+      }
+    ],
+    "notificationDestination": "http://pci-planning-rapp.nonrtric.svc.cluster.local:8080/api/health",
+    "onboardingInformation": {
+      "apiInvokerPublicKey": "PCI_PLANNING_RAPP_PUBLIC_KEY_DO_NOT_CHANGE_THIS_RAPP_INSTANCE_ID",
+      "apiInvokerCertificate": "PCI_PLANNING_RAPP_CERTIFICATE_PLACEHOLDER"
+    },
+    "requestTestNotification": false
+  }
+]

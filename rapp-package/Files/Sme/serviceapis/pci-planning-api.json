@@ -1,0 +1,72 @@
+{
+  "apiName": "pci-planning-api",
+  "description": "PCI Planning and Optimization rApp overview conflicts and decisions API",
+  "aefProfiles": [
+    {
+      "aefId": "PCI Planning and Optimization rApp as AEF",
+      "description": "PCI overview conflict detection and decision endpoints",
+      "versions": [
+        {
+          "apiVersion": "v1",
+          "resources": [
+            {
+              "resourceName": "health",
+              "commType": "REQUEST_RESPONSE",
+              "uri": "/api/health",
+              "operations": [
+                "GET"
+              ]
+            },
+            {
+              "resourceName": "overview",
+              "commType": "REQUEST_RESPONSE",
+              "uri": "/api/overview",
+              "operations": [
+                "GET"
+              ]
+            },
+            {
+              "resourceName": "cells",
+              "commType": "REQUEST_RESPONSE",
+              "uri": "/api/cells",
+              "operations": [
+                "GET"
+              ]
+            },
+            {
+              "resourceName": "conflicts",
+              "commType": "REQUEST_RESPONSE",
+              "uri": "/api/conflicts",
+              "operations": [
+                "GET"
+              ]
+            },
+            {
+              "resourceName": "decisions",
+              "commType": "REQUEST_RESPONSE",
+              "uri": "/api/decisions",
+              "operations": [
+                "GET"
+              ]
+            },
+            {
+              "resourceName": "plan",
+              "commType": "REQUEST_RESPONSE",
+              "uri": "/api/plan",
+              "operations": [
+                "GET"
+              ]
+            }
+          ]
+        }
+      ],
+      "protocol": "HTTP_1_1",
+      "interfaceDescriptions": [
+        {
+          "ipv4Addr": "pci-planning-rapp.nonrtric.svc.cluster.local",
+          "port": 8080
+        }
+      ]
+    }
+  ]
+}
