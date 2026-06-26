@@ -1,0 +1,33 @@
+{
+  "name": "pci-planning-rapp-instance-DO_NOT_CHANGE_THIS_RAPP_INSTANCE_ID",
+  "version": "2.1.0",
+  "compositionId": "DO_NOT_CHANGE_THIS_COMPOSITION_ID",
+  "description": "PCI Planning and Optimization rApp automation composition instance",
+  "elements": {
+    "4bc40907-0d4b-45a6-a479-180a850b4348": {
+      "id": "4bc40907-0d4b-45a6-a479-180a850b4348",
+      "definition": {
+        "name": "onap.policy.clamp.ac.element.PciPlanningK8sElement",
+        "version": "1.0.0"
+      },
+      "description": "PCI Planning and Optimization rApp K8S element",
+      "properties": {
+        "chart": {
+          "chartId": {
+            "name": "pci-planning-rapp",
+            "version": "2.1.0"
+          },
+          "repository": {
+            "repoName": "chartmuseum",
+            "address": "http://chartmuseum.nonrtric:8080"
+          },
+          "releaseName": "pci-planning-rapp",
+          "namespace": "nonrtric"
+        },
+        "values": {
+          "_note": "Ignored by the K8s participant; real config lives in the chart's values.yaml."
+        }
+      }
+    }
+  }
+}

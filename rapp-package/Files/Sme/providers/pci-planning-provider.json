@@ -1,0 +1,22 @@
+{
+  "apiProvDomInfo": "PCI Planning and Optimization rApp Provider Domain",
+  "apiProvFuncs": [
+    {
+      "apiProvFuncId": "APF_PCI_PLANNING_PLACEHOLDER",
+      "apiProvFuncInfo": "PCI Planning and Optimization rApp API Publishing Function",
+      "apiProvFuncRole": "APF",
+      "regInfo": {
+        "apiProvPubKey": "NOT_USED"
+      }
+    },
+    {
+      "apiProvFuncId": "AEF_PCI_PLANNING_PLACEHOLDER",
+      "apiProvFuncInfo": "PCI Planning and Optimization rApp API Exposing Function - exposes overview and conflict APIs",
+      "apiProvFuncRole": "AEF",
+      "regInfo": {
+        "apiProvPubKey": "NOT_USED"
+      }
+    }
+  ],
+  "regSec": "PSK"
+}
