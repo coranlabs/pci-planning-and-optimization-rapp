@@ -82,3 +82,104 @@ ssh-keyscan -p <port> -H <pm-sftp-host>
 Choose the InfluxDB credentials once and keep them. The volume survives an
 undeploy, and a redeploy with different credentials cannot open it.
 
+## 4. CSAR
+
+```bash
+./scripts/create-csar.sh
+```
+
+It checks the placeholders, packages the chart, mints a fresh ACM element UUID
+because the runtime rejects one it has seen, writes the manifest with SHA-256
+hashes for every packaged file, and leaves the CSAR under `rapp-package/dist/`.
+The tracked instance file is not modified; the fresh UUID is stamped into the
+build copy only.
+
+The InfluxDB subchart is vendored under `deploy/helm/pci-planning-rapp/charts/`,
+so packaging needs no network and no `helm dependency update`.
+
+## 5. Upload the chart
+
+```bash
+curl -s -X DELETE http://$CM:8080/api/charts/pci-planning-rapp/2.1.0
+curl -s --data-binary @rapp-package/dist/build/Artifacts/Deployment/HELM/pci-planning-rapp-2.1.0.tgz \
+  http://$CM:8080/api/charts
+```
+
+ChartMuseum must be whitelisted in the Kubernetes participant's configmap,
+otherwise the install is refused.
+
+```bash
+kubectl get configmap onap-policy-clamp-ac-k8s-ppnt-configmap -n onap -o yaml | grep -A3 repos
+```
+
+## 6. Onboard, prime, instantiate, deploy
+
+The path segment is the rApp name, not the identifier the API returns.
+
+```bash
+curl -s -X POST http://$RM:8080/rapps/pci-planning-rapp \
+  -F file=@rapp-package/dist/pci-planning-rapp-2.1.0.csar
+
+curl -s -X PUT http://$RM:8080/rapps/pci-planning-rapp \
+  -H 'Content-Type: application/json' -d '{"primeOrder":"PRIME"}'
+
+IID=$(curl -s -X POST http://$RM:8080/rapps/pci-planning-rapp/instance \
+  -H 'Content-Type: application/json' \
+  -d '{"acm":{"instance":"pciplanning-instance"},
+       "sme":{"providerFunction":"pci-planning-provider",
+              "serviceApis":"pci-planning-api",
+              "invokers":"ics-invoker"}}' \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["rappInstanceId"])')
+
+curl -s -X PUT http://$RM:8080/rapps/pci-planning-rapp/instance/$IID \
+  -H 'Content-Type: application/json' -d '{"deployOrder":"DEPLOY"}'
+```
+
+Every value in the instance body is the base name of a file under
+`rapp-package/Files`. The rApp publishes APIs but produces no information types,
+so the body carries no `dme` section and the deployment runs in a single phase.
+
+## 7. Verify
+
+```bash
+curl -s http://$RM:8080/rapps/pci-planning-rapp/instance/$IID
+kubectl get pods -n nonrtric | grep pci-planning
+curl -s -o /dev/null -w '%{http_code}\n' http://$SMO_HOST:30090/healthz
+curl -s http://$SMO_HOST:30090/api/health
+```
+
+The instance reaches `DEPLOYED`, and the rApp and its InfluxDB both run.
+`/api/health` reports each component separately. The pod logs open with a BOOT
+panel naming every component and whether it came up, so an unfilled credential
+shows there rather than as silence in the dashboard.
+
+```bash
+kubectl logs -n nonrtric deploy/pci-planning-rapp | head -40
+```
+
+The dashboard is at `http://$SMO_HOST:30090/ui/index.html`, behind the operator
+login from `admin.username` and `admin.password`. It fills once the environment
+publishes PM files to the Kafka topic named in the chart values. An idle topic
+is not an error.
+
+## 8. Teardown
+
+```bash
+curl -s -X PUT http://$RM:8080/rapps/pci-planning-rapp/instance/$IID \
+  -H 'Content-Type: application/json' -d '{"deployOrder":"UNDEPLOY"}'
+curl -s -X DELETE http://$RM:8080/rapps/pci-planning-rapp/instance/$IID
+curl -s -X PUT http://$RM:8080/rapps/pci-planning-rapp \
+  -H 'Content-Type: application/json' -d '{"primeOrder":"DEPRIME"}'
+curl -s -X DELETE http://$RM:8080/rapps/pci-planning-rapp
+```
+
+Follow that order. Afterwards check that the Helm release is gone and remove the
+published API from CAPIF and its service and routes from Kong: teardown often
+leaves them behind, and the next deploy fails against the leftovers.
+
+```bash
+curl -s http://$KONG:8001/services | grep pci-planning
+```
+
+The InfluxDB volume survives an undeploy. Delete it too if you want a clean
+database on the next run.
