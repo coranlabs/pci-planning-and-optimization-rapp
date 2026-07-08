@@ -4,6 +4,19 @@ dist/
 
 /runs/
 
+.venv/
+venv/
+env/
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+
+.env
+.env.*
+
+.coverage
+htmlcov/
+
 .vscode/
 .idea/
 .DS_Store
