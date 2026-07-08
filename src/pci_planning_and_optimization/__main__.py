@@ -300,7 +300,7 @@ def detect(
             f"mod3={cs[CLASS_MOD3].n_pairs}  "
             f"mod4={cs[CLASS_MOD4].n_pairs}  "
             f"mod30={cs[CLASS_MOD30].n_pairs}  "
-            f"predicted_ho_avoided≈{report.predicted_ho_failures_avoided:.0f}/wk"
+            f"predicted_ho_avoided≈{report.predicted_ho_failures_avoided:.0f}/period"
         )
 
     out_path = Path(output_file)
@@ -391,7 +391,7 @@ def optimize(
             1 for c in run.changes if c.reason_code == "MODN_INTERFERENCE_REDUCTION"
         )
         total_predicted = sum(
-            c.predicted_ho_failures_avoided_per_week for c in run.changes
+            c.predicted_ho_failures_avoided_per_period for c in run.changes
         )
         click.echo(
             f"[{tech.value.upper()}] cells={run.n_cells}  "
@@ -400,7 +400,7 @@ def optimize(
             f"passes={run.passes_executed} "
             f"converged={run.converged}  "
             f"final_soft_cost={run.final_soft_cost:.3f}  "
-            f"predicted_ho_avoided≈{total_predicted:.0f}/wk"
+            f"predicted_ho_avoided≈{total_predicted:.0f}/period"
         )
 
         tech_log.info(
@@ -505,7 +505,7 @@ def validate(
             f"confusions={b.n_confusions}->{a.n_confusions} "
             f"mod3={b.n_mod3}->{a.n_mod3} "
             f"mod30={b.n_mod30}->{a.n_mod30} "
-            f"predicted_ho_avoided≈{report.predicted_ho_failures_avoided_per_week:.0f}/wk"
+            f"predicted_ho_avoided≈{report.predicted_ho_failures_avoided_per_period:.0f}/period"
         )
 
     md = render_dashboard_markdown(
@@ -738,7 +738,7 @@ def serve(
         banner.check(True, "http server", "in-flight requests drained · listener closed")
         banner.check(
             bool(stats.get("enabled")), "influxdb",
-            f"{stats.get('writes_ok', 0)} points written · writer closed"
+            f"{stats.get('points_queued', 0)} points written · writer closed"
             if stats.get("enabled") else "was not running",
         )
         banner.blank()

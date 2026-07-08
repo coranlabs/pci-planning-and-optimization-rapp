@@ -654,22 +654,23 @@ class DashboardData:
         blocked_mod3 = {n.pci % 3 for n in same_freq}
 
         lo, hi = _pci_pool_range(self._config, cell)
+        used_in_pool: dict[int, int] = {}
+        for c in network.cells.values():
+            if c.primary_frequency() == freq and lo <= c.pci < hi:
+                used_in_pool[c.pci] = used_in_pool.get(c.pci, 0) + 1
+
+        order = sorted(range(lo, hi), key=lambda p: (used_in_pool.get(p, 0), p))
         clean = next(
-            (p for p in range(lo, hi)
+            (p for p in order
              if p != cell.pci and p not in blocked and (p % 3) not in blocked_mod3),
             None,
         )
         proposed = clean if clean is not None else next(
-            (p for p in range(lo, hi) if p != cell.pci and p not in blocked),
+            (p for p in order if p != cell.pci and p not in blocked),
             None,
         )
         if proposed is None:
             return {"ok": False, "error": "No free PCI in the pool"}
-
-        used_in_pool = {
-            c.pci for c in network.cells.values()
-            if c.primary_frequency() == freq and lo <= c.pci < hi
-        }
         reasons = [
             f"clear of {len(same_freq)} co-frequency neighbour"
             f"{'' if len(same_freq) == 1 else 's'}",

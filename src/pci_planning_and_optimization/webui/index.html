@@ -317,6 +317,16 @@ limitations under the License.
 
 
     .grid { display: grid; gap: var(--gap-4); }
+    .cell-map-grid { align-items: stretch; }
+    @media (min-width: 1281px) {
+      .cell-map-grid { height: calc(100vh - 230px); max-height: 820px; min-height: 540px; }
+      .cell-map-grid > * { min-height: 0; }
+      .cell-map-side { overflow-y: auto; }
+    }
+    @media (max-width: 1280px) {
+      .cell-map-grid { grid-template-columns: minmax(0, 1fr) !important; }
+      .cell-map-panel { min-height: 540px; }
+    }
 
 
     .panel { padding: var(--pad-panel); display: flex; flex-direction: column; gap: 14px; min-width: 0; }

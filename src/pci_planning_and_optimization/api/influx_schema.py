@@ -70,7 +70,7 @@ FIELD_RUN_N_CHANGES:               Final[str] = "n_changes"
 FIELD_RUN_N_CELLS:                 Final[str] = "n_cells"
 FIELD_RUN_PASSES_EXECUTED:         Final[str] = "passes_executed"
 FIELD_RUN_FINAL_SOFT_COST:         Final[str] = "final_soft_cost"
-FIELD_RUN_PREDICTED_AVOIDED_PER_WEEK: Final[str] = "predicted_avoided_per_week"
+FIELD_RUN_PREDICTED_AVOIDED_PER_PERIOD: Final[str] = "predicted_avoided_per_period"
 FIELD_RUN_CONVERGED:               Final[str] = "converged"
 
 

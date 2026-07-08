@@ -120,25 +120,22 @@ select = [
 ]
 ignore = [
     "E501",     # line length is the formatter's job
-    "ANN401",   # Any is deliberate in the few places it appears
-    "S101",     # asserts are fine in tests
-    "S311",     # standard PRNG, not used for anything security-bearing
-    "RUF001",   # prose uses non-ASCII punctuation deliberately
+    "ANN401",
+    "S101",
+    "S311",
+    "RUF001",
     "RUF002",
     "RUF003",
-    "S310",     # URL schemes are allowlisted before opening
-    "ASYNC109", # timeout= is the public API here; asyncio, not trio
-    "ASYNC240", # trio/anyio rule; this codebase is asyncio plus pathlib
+    "S310",
+    "ASYNC109",
+    "ASYNC240",
 ]
 fixable = ["ALL"]
 
 [tool.ruff.lint.flake8-bugbear]
-# FastAPI puts its dependency markers in argument defaults by design.
 extend-immutable-calls = ["fastapi.Depends", "fastapi.File", "fastapi.Form", "fastapi.Query"]
 
 [tool.ruff.lint.flake8-type-checking]
-# Pydantic and dataclasses evaluate annotations at runtime, so their imports
-# must stay out of the TYPE_CHECKING block.
 runtime-evaluated-base-classes = [
     "pydantic.BaseModel",
     "pydantic_settings.BaseSettings",
@@ -149,8 +146,8 @@ runtime-evaluated-decorators = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"src/pci_planning_and_optimization/main.py" = ["S104"]      # 0.0.0.0 bind is intentional
-"src/pci_planning_and_optimization/__main__.py" = ["S104"]  # same, for the serve CLI default
+"src/pci_planning_and_optimization/main.py" = ["S104"]
+"src/pci_planning_and_optimization/__main__.py" = ["S104"]
 
 [tool.ruff.format]
 quote-style = "double"

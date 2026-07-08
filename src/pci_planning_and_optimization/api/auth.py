@@ -39,7 +39,7 @@ from pci_planning_and_optimization.resilience.ratelimit import (
 _log = logging.getLogger("pci_planning_and_optimization.api.auth")
 
 ADMIN_USER_ENV = "RAPP_ADMIN_USERNAME"
-ADMIN_PASSWORD_ENV = "RAPP_ADMIN_PASSWORD"  # noqa: S105 - the variable name, not a secret
+ADMIN_PASSWORD_ENV = "RAPP_ADMIN_PASSWORD"
 ADMIN_HASH_ENV = "RAPP_ADMIN_PASSWORD_HASH"
 
 SESSION_COOKIE = "pci_session"

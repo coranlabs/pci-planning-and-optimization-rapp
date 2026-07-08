@@ -83,7 +83,7 @@ class ChangeRecommendation:
     sort_key_old: tuple[float, ...]
     sort_key_new: tuple[float, ...]
 
-    predicted_ho_failures_avoided_per_week: float
+    predicted_ho_failures_avoided_per_period: float
 
     pass_number: int
     locked_neighborhood: list[str]
@@ -97,8 +97,8 @@ class ChangeRecommendation:
                 "group": self.pci_components_new[0],
                 "sub": self.pci_components_new[1],
             }
-        d["predicted_ho_failures_avoided_per_week"] = round(
-            self.predicted_ho_failures_avoided_per_week, 1
+        d["predicted_ho_failures_avoided_per_period"] = round(
+            self.predicted_ho_failures_avoided_per_period, 1
         )
         return d
 
@@ -154,12 +154,29 @@ class OptimizationRun:
         }
 
 
+def pci_usage_by_frequency(
+    network: Network, technology: Technology
+) -> dict[object, dict[int, int]]:
+    out: dict[object, dict[int, int]] = {}
+    for cell in network.cells.values():
+        if cell.technology != technology:
+            continue
+        freq = cell.primary_frequency()
+        if freq is None:
+            continue
+        counts = out.setdefault(freq, {})
+        counts[cell.pci] = counts.get(cell.pci, 0) + 1
+    return out
+
+
 def pick_pci(
     cell: Cell,
     allowed_pool: set[int],
     network: Network,
     scoring_cfg,
     weight_provider: WeightProvider,
+    *,
+    pci_usage: dict[int, int] | None = None,
 ) -> tuple[int, tuple[float, ...]] | None:
     if not allowed_pool:
         return None
@@ -171,7 +188,8 @@ def pick_pci(
 
     for cand in allowed_pool:
         key = candidate_sort_key(
-            network, cell, cand, scoring_cfg, weight_provider, neighbors=neighbors
+            network, cell, cand, scoring_cfg, weight_provider,
+            neighbors=neighbors, pci_usage=pci_usage,
         )
         if best_key is None or key < best_key:
             best_key = key
@@ -287,6 +305,8 @@ def conservative_color_pass(
 
     candidates = _cells_to_consider(network, technology, bundle)
 
+    usage_by_frequency = pci_usage_by_frequency(network, technology)
+
     changes: list[ChangeRecommendation] = []
 
     for cell in candidates:
@@ -308,9 +328,14 @@ def conservative_color_pass(
             continue
 
         old_pci = cell.pci
-        old_key = candidate_sort_key(network, cell, old_pci, config.scoring, weight_provider)
+        usage = usage_by_frequency.get(cell.primary_frequency(), {})
+        old_key = candidate_sort_key(
+            network, cell, old_pci, config.scoring, weight_provider, pci_usage=usage,
+        )
 
-        result = pick_pci(cell, allowed, network, config.scoring, weight_provider)
+        result = pick_pci(
+            cell, allowed, network, config.scoring, weight_provider, pci_usage=usage,
+        )
         if result is None:
             continue
         new_pci, new_key = result
@@ -338,6 +363,9 @@ def conservative_color_pass(
             )
             continue
 
+        usage[old_pci] = max(0, usage.get(old_pci, 1) - 1)
+        usage[new_pci] = usage.get(new_pci, 0) + 1
+
         ho_impact = _estimate_ho_avoided(network, cell, old_pci, new_pci, weight_provider)
 
         newly_locked = _lock_neighborhood(network, cell.id, locked)
@@ -357,7 +385,7 @@ def conservative_color_pass(
             reason_text=reason_text,
             sort_key_old=old_key,
             sort_key_new=new_key,
-            predicted_ho_failures_avoided_per_week=ho_impact,
+            predicted_ho_failures_avoided_per_period=ho_impact,
             pass_number=pass_number,
             locked_neighborhood=newly_locked,
         )
@@ -419,6 +447,7 @@ def run_optimization(
 ) -> OptimizationRun:
     weight_provider = weight_provider or default_weight_provider(network)
     policy = policy or OperatorPolicy(config)
+    policy.validate_pool_sizes(network)
 
     if max_changes_override is not None:
         per_run_budget = max_changes_override

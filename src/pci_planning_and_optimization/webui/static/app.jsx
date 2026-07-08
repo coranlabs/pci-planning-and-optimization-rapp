@@ -143,7 +143,7 @@ function Sidebar({ active, onSelect, onOpenNotifications }) {
       <div className="rail-brand-row">
         <div className="rail-brand">
           <img
-            src={logoUrl || '/static/img/coran-logo.png'}
+            src={logoUrl || '/static/coran-logo.png'}
             alt="Coran Labs"
             style={{ width: '100%', height: '100%', objectFit: 'contain' }}
           />
@@ -369,8 +369,8 @@ function CellMapView({ onSelectCell, selectedCell }) {
             <Icon name="layers" size={12}/>Layers
           </button>
         </>}/>
-      <div className="grid cell-map-grid" style={{ gridTemplateColumns: 'minmax(0, 2fr) minmax(360px, 1fr)', alignItems: 'flex-start' }}>
-        <div className="panel" style={{ padding: 0, overflow: 'hidden', display: 'flex', flexDirection: 'column', height: 'calc(100vh - 230px)', maxHeight: 820, minHeight: 540 }}>
+      <div className="grid cell-map-grid" style={{ gridTemplateColumns: 'minmax(0, 2fr) minmax(360px, 1fr)' }}>
+        <div className="panel cell-map-panel" style={{ padding: 0, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
           <div className="panel-head" style={{ padding: 'var(--pad-panel)', paddingBottom: 8, flexShrink: 0 }}>
             <div className="titles">
               <h3 className="panel-title">Topology · live</h3>
@@ -381,7 +381,7 @@ function CellMapView({ onSelectCell, selectedCell }) {
           <BigTopo onSelectCell={onSelectCell} selectedCell={selectedCell}
             colorMode={colorMode} showOverlays={showOverlays}/>
         </div>
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+        <div className="cell-map-side" style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
           <RegionPanel/>
           <AlertsPanel />
         </div>
@@ -392,14 +392,15 @@ function CellMapView({ onSelectCell, selectedCell }) {
 }
 
 
-// Basemap. Blank by default, so the dashboard makes no third-party request,
-// works in an air-gapped cluster, and does not hand a tile host the operator's
-// map viewport. Set a style URL, your own tile server or a public basemap, for
-// street detail.
-const BASEMAP_URL = { light: '', dark: '' };
+const BASEMAP_URL = {
+  light: 'https://basemaps.cartocdn.com/gl/positron-gl-style/style.json',
+  dark:  'https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json',
+};
 
-function mapStyle(theme) {
-  if (BASEMAP_URL[theme]) return BASEMAP_URL[theme];
+const ESC_CHARS = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+const esc = (v) => String(v == null ? '' : v).replace(/[&<>"']/g, (c) => ESC_CHARS[c]);
+
+function offlineMapStyle(theme) {
   return {
     version: 8,
     sources: {},
@@ -409,6 +410,11 @@ function mapStyle(theme) {
       paint: { 'background-color': theme === 'dark' ? '#0F1115' : '#EEF1F5' },
     }],
   };
+}
+
+function mapStyle(theme) {
+  if (BASEMAP_URL[theme]) return BASEMAP_URL[theme];
+  return offlineMapStyle(theme);
 }
 
 
@@ -571,6 +577,12 @@ function BigTopo({ onSelectCell, selectedCell, colorMode = 'status', showOverlay
       maxZoom: 18,
       antialias: true,
       attributionControl: { compact: true },
+    });
+    let basemapFellBack = false;
+    m.on('error', () => {
+      if (basemapFellBack || m.isStyleLoaded()) return;
+      basemapFellBack = true;
+      m.setStyle(offlineMapStyle(themeRef.current), { diff: false });
     });
     m.addControl(new window.maplibregl.NavigationControl({ visualizePitch: true }), 'top-left');
     m.addControl(new window.maplibregl.ScaleControl({ unit: 'metric' }), 'bottom-right');
@@ -927,7 +939,7 @@ function BigTopo({ onSelectCell, selectedCell, colorMode = 'status', showOverlay
     }
 
 
-    entry.popupHtml = `<b>${c.id}</b> · PCI ${c.pci}<br/>${c.site} · ${c.region}<br/>${c.status} · ${c.dl.toFixed(0)} Mbps DL · ${c.prb}% PRB`
+    entry.popupHtml = `<b>${esc(c.id)}</b> · PCI ${c.pci}<br/>${esc(c.site)} · ${esc(c.region)}<br/>${esc(c.status)} · ${c.dl.toFixed(0)} Mbps DL · ${c.prb}% PRB`
       + (isConfl ? '<br/><span style="color:#EF4444">⚠ in conflict</span>' : '')
       + (c.approxPos ? '<br/><span style="color:#F59E0B">◌ approximate position — no TOPO geodata</span>' : '');
     entry.popupLngLat = [c.lng, c.lat];
@@ -993,7 +1005,7 @@ function BigTopo({ onSelectCell, selectedCell, colorMode = 'status', showOverlay
 
 
     const ids = members.slice(0, 6).map(c => c.id).join(', ') + (members.length > 6 ? `, +${members.length - 6} more` : '');
-    entry.popupHtml = `<b>${members.length} cells</b>${conflictCount > 0 ? ` · <span style="color:#EF4444">${conflictCount} in conflict</span>` : ''}<br/><span style="font-size:11px;color:#9DB0D9">${ids}</span><br/><span style="font-size:11px;color:#5E709C">Click or zoom in to expand</span>`;
+    entry.popupHtml = `<b>${members.length} cells</b>${conflictCount > 0 ? ` · <span style="color:#EF4444">${conflictCount} in conflict</span>` : ''}<br/><span style="font-size:11px;color:#9DB0D9">${esc(ids)}</span><br/><span style="font-size:11px;color:#5E709C">Click or zoom in to expand</span>`;
     entry.popupLngLat = [lng, lat];
     if (entry.popup.isOpen()) {
       entry.popup.setLngLat(entry.popupLngLat).setHTML(entry.popupHtml);

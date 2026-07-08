@@ -79,7 +79,7 @@ def _render_ho_impact(report: HoValidationReport) -> list[str]:
     out.append("|---|---|")
     out.append(
         f"| Predicted HO failures avoided / week | "
-        f"~{report.predicted_ho_failures_avoided_per_week:.0f} (estimate) |"
+        f"~{report.predicted_ho_failures_avoided_per_period:.0f} (estimate) |"
     )
     out.append(
         f"| Projected HOSR delta (lower bound) | "
@@ -248,7 +248,7 @@ def _render_changes(
 
     sorted_recs = sorted(
         recommendations,
-        key=lambda r: -float(r.get("predicted_ho_failures_avoided_per_week", 0.0)),
+        key=lambda r: -float(r.get("predicted_ho_failures_avoided_per_period", 0.0)),
     )
     if sorted_recs:
         out.append("Top changes by predicted HO impact:")
@@ -259,7 +259,7 @@ def _render_changes(
             out.append(
                 f"| `{rec['cell_id']}` | {rec['pci_old']} → {rec['pci_new']} | "
                 f"{rec['reason_code']} | "
-                f"~{float(rec.get('predicted_ho_failures_avoided_per_week', 0)):.0f} |"
+                f"~{float(rec.get('predicted_ho_failures_avoided_per_period', 0)):.0f} |"
             )
         out.append("")
 

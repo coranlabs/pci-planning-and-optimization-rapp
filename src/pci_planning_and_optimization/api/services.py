@@ -139,9 +139,14 @@ def compute_kpis(network: Network | None) -> dict[str, Any]:
 def list_run_files(runs_dir: Path) -> list[Path]:
     if not runs_dir.is_dir():
         return []
-    files = [p for p in runs_dir.glob("*.json") if p.is_file()]
+    files = [p for p in runs_dir.glob("*.json") if p.is_file() and _is_run_file(p)]
     files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     return files
+
+
+def _is_run_file(path: Path) -> bool:
+    run = load_run(path)
+    return isinstance(run, dict) and bool(run.get("run_id"))
 
 
 def load_run(path: Path) -> dict[str, Any] | None:

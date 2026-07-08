@@ -68,6 +68,7 @@ class InfluxWriter:
     _enabled_at_runtime: bool = field(default=False, init=False)
     _write_errors: int = field(default=0, init=False)
     _writes_ok: int = field(default=0, init=False)
+    _points_queued: int = field(default=0, init=False)
     _last_error: str | None = field(default=None, init=False)
 
     def __post_init__(self) -> None:
@@ -104,7 +105,10 @@ class InfluxWriter:
                     max_retries=3,
                     max_retry_delay=30_000,
                     exponential_base=2,
-                )
+                ),
+                success_callback=self._on_batch_ok,
+                error_callback=self._on_batch_error,
+                retry_callback=self._on_batch_retry,
             )
             self._enabled_at_runtime = True
             _log.info(
@@ -141,8 +145,10 @@ class InfluxWriter:
     def stats(self) -> dict[str, Any]:
         return {
             "enabled": self._enabled_at_runtime,
+            "points_queued": self._points_queued,
             "writes_ok": self._writes_ok,
             "write_errors": self._write_errors,
+            "writes_failing": self._write_errors > 0 and self._writes_ok == 0,
             "last_error": self._last_error,
         }
 
@@ -271,7 +277,7 @@ class InfluxWriter:
             soft = float(run_dict.get("final_soft_cost") or 0.0)
             converged = 1 if run_dict.get("converged") else 0
             avoided = sum(
-                float(c.get("predicted_ho_failures_avoided_per_week") or 0.0)
+                float(c.get("predicted_ho_failures_avoided_per_period") or 0.0)
                 for c in run_dict.get("changes") or []
             )
             self._write_point(
@@ -286,7 +292,7 @@ class InfluxWriter:
                     S.FIELD_RUN_N_CELLS: n_cells,
                     S.FIELD_RUN_PASSES_EXECUTED: passes,
                     S.FIELD_RUN_FINAL_SOFT_COST: soft,
-                    S.FIELD_RUN_PREDICTED_AVOIDED_PER_WEEK: avoided,
+                    S.FIELD_RUN_PREDICTED_AVOIDED_PER_PERIOD: avoided,
                     S.FIELD_RUN_CONVERGED: converged,
                 },
             )
@@ -309,9 +315,25 @@ class InfluxWriter:
                     continue
                 p.field(k, v)
             self._write_api.write(bucket=self.cfg.bucket, org=self.cfg.org, record=p)
-            self._writes_ok += 1
+            self._points_queued += 1
         except Exception as e:
             self._note_error(f"write[{measurement}]", e)
+
+    def _on_batch_ok(self, _conf: Any, _data: Any) -> None:
+        self._writes_ok += 1
+
+    def _on_batch_error(self, _conf: Any, _data: Any, exception: Exception) -> None:
+        self._write_errors += 1
+        self._last_error = f"{type(exception).__name__}: {exception}"
+        if _throttle.should_log("writer:batch"):
+            _log.error(
+                "InfluxWriter: batch rejected by %s — nothing was stored: %s",
+                getattr(self.cfg, "url", "influxdb"), self._last_error,
+            )
+
+    def _on_batch_retry(self, _conf: Any, _data: Any, exception: Exception) -> None:
+        if _throttle.should_log("writer:retry"):
+            _log.warning("InfluxWriter: retrying batch after %s", exception)
 
     def _note_error(self, op: str, err: Exception) -> None:
         self._write_errors += 1

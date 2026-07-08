@@ -12,10 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Basemap. Blank by default, so the dashboard makes no third-party request,
-// works in an air-gapped cluster, and does not hand a tile host the operator's
-// map viewport. Set a style URL, your own tile server or a public basemap, for
-// street detail.
 const BASEMAP_URL = { light: '', dark: '' };
 
 function planMapStyle(theme) {

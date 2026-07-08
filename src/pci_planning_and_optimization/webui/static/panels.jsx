@@ -678,7 +678,10 @@ const ThroughputChart = () => {
   const tpTicks = Array.from({ length: yTicks + 1 }, (_, i) => (tpMax / yTicks) * i);
 
 
-  const spansDays = window.PCI_TS_RANGE === '7d';
+  const firstIso = sliced.length ? sliced[0].iso : null;
+  const lastIso = sliced.length ? sliced[sliced.length - 1].iso : null;
+  const spanMs = (firstIso && lastIso) ? (new Date(lastIso) - new Date(firstIso)) : 0;
+  const spansDays = spanMs >= 2 * 86400000;
   const xLabelEvery = Math.ceil(sliced.length / (spansDays ? 6 : 8));
   const fmt = (p, opts) => (p.iso && window.formatTime) ? window.formatTime(p.iso, opts) : p.t;
   const tLabel = (p) => fmt(p, spansDays

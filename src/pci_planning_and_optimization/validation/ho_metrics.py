@@ -114,7 +114,7 @@ class HoValidationReport:
     reuse_distance_before: ReuseDistanceStats
     reuse_distance_after: ReuseDistanceStats
 
-    predicted_ho_failures_avoided_per_week: float
+    predicted_ho_failures_avoided_per_period: float
     projected_hosr_delta_pp_lower_bound: float
 
     def to_dict(self) -> dict[str, Any]:
@@ -132,8 +132,8 @@ class HoValidationReport:
             "palette_after": self.palette_after.to_dict(),
             "reuse_distance_before": self.reuse_distance_before.to_dict(),
             "reuse_distance_after": self.reuse_distance_after.to_dict(),
-            "predicted_ho_failures_avoided_per_week": round(
-                self.predicted_ho_failures_avoided_per_week, 1
+            "predicted_ho_failures_avoided_per_period": round(
+                self.predicted_ho_failures_avoided_per_period, 1
             ),
             "projected_hosr_delta_pp_lower_bound": round(
                 self.projected_hosr_delta_pp_lower_bound, 3
@@ -273,7 +273,7 @@ def compute_ho_validation(
             palette_after=empty_palette,
             reuse_distance_before=empty_reuse,
             reuse_distance_after=empty_reuse,
-            predicted_ho_failures_avoided_per_week=0.0,
+            predicted_ho_failures_avoided_per_period=0.0,
             projected_hosr_delta_pp_lower_bound=0.0,
         )
 
@@ -295,7 +295,7 @@ def compute_ho_validation(
     reuse_after = _reuse_distance_stats(after_network, technology)
 
     predicted_ho_avoided = sum(
-        float(r.get("predicted_ho_failures_avoided_per_week", 0.0))
+        float(r.get("predicted_ho_failures_avoided_per_period", 0.0))
         for r in tech_recs
     )
 
@@ -334,6 +334,6 @@ def compute_ho_validation(
         palette_after=palette_after,
         reuse_distance_before=reuse_before,
         reuse_distance_after=reuse_after,
-        predicted_ho_failures_avoided_per_week=predicted_ho_avoided,
+        predicted_ho_failures_avoided_per_period=predicted_ho_avoided,
         projected_hosr_delta_pp_lower_bound=hosr_delta,
     )

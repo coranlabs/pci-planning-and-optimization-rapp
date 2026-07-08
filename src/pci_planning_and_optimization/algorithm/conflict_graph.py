@@ -202,36 +202,45 @@ def detect_collisions(network: Network, technology: Technology) -> list[Conflict
     return _sort_conflicts(conflicts)
 
 
+def _pair_relation_source(network: Network, a: Cell, b: Cell) -> str:
+    for rel in (network.relation(a.id, b.id), network.relation(b.id, a.id)):
+        if rel is not None and rel.relation_source == RelationSource.REAL:
+            return "real"
+    return "shadow"
+
+
 def detect_confusions(network: Network, technology: Technology) -> list[ConflictEdge]:
-    conflicts: list[ConflictEdge] = []
-    real_neighbors = _real_neighbor_map(network)
-    for a, b, source in _iter_intra_tech_pairs(network, technology):
-        if a.pci == b.pci:
+    conflicts: dict[tuple[str, str], ConflictEdge] = {}
+    for source_id, neighbor_ids in _real_neighbor_map(network).items():
+        source = network.cells.get(source_id)
+        if source is None or source.technology != technology:
             continue
 
-        is_confusion = False
-        for source_cell, target in ((a, b), (b, a)):
-            for nb_id in real_neighbors.get(source_cell.id, ()):
-                if nb_id == target.id:
-                    continue
-                nb = network.cells.get(nb_id)
-                if nb is None or nb.technology != technology:
-                    continue
-                if nb.pci != target.pci:
-                    continue
-                if nb.primary_frequency() != target.primary_frequency():
-                    continue
-                is_confusion = True
-                break
-            if is_confusion:
-                break
+        by_pci: dict[tuple[int, object], list[Cell]] = {}
+        for nb_id in neighbor_ids:
+            nb = network.cells.get(nb_id)
+            if nb is None or nb.technology != technology:
+                continue
+            freq = nb.primary_frequency()
+            if freq is None:
+                continue
+            by_pci.setdefault((nb.pci, freq), []).append(nb)
 
-        if not is_confusion:
-            continue
-        conflicts.append(_build_edge(
-            network, a, b, relation_source=source, conflict_class=CLASS_CONFUSION,
-        ))
-    return _sort_conflicts(conflicts)
+        for group in by_pci.values():
+            if len(group) < 2:
+                continue
+            for i, x in enumerate(group):
+                for y in group[i + 1:]:
+                    a, b = (x, y) if x.id < y.id else (y, x)
+                    key = (a.id, b.id)
+                    if key in conflicts:
+                        continue
+                    conflicts[key] = _build_edge(
+                        network, a, b,
+                        relation_source=_pair_relation_source(network, a, b),
+                        conflict_class=CLASS_CONFUSION,
+                    )
+    return _sort_conflicts(list(conflicts.values()))
 
 
 def compute_modN_violations(

@@ -53,6 +53,23 @@ def _package_root() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
+def _blank_secrets(cfg: Any) -> Any:
+    safe = cfg.model_copy(deep=True)
+    safe.sdnr.password = ""
+    safe.osc.kafka.password = ""
+    safe.influxdb.token = ""
+    return safe
+
+
+def _carry_secrets(new_cfg: Any, current: Any) -> Any:
+    if current is None:
+        return new_cfg
+    new_cfg.sdnr.password = current.sdnr.password
+    new_cfg.osc.kafka.password = current.osc.kafka.password
+    new_cfg.influxdb.token = current.influxdb.token
+    return new_cfg
+
+
 _log = logging.getLogger("pci_planning_and_optimization.api.server")
 
 
@@ -241,11 +258,20 @@ def create_app(
             stats = app.state.influx_writer.stats() if app.state.influx_writer else {}
             full_note = note
             if stats:
-                full_note += f"; writer writes_ok={stats.get('writes_ok', 0)} errors={stats.get('write_errors', 0)}"
-            influx_component = {"status": "ok" if ok else "down", "note": full_note}
+                full_note += (
+                    f"; writer queued={stats.get('points_queued', 0)}"
+                    f" writes_ok={stats.get('writes_ok', 0)}"
+                    f" errors={stats.get('write_errors', 0)}"
+                )
+            influx_status = "ok" if ok else "down"
+            if ok and stats.get("writes_failing"):
+                influx_status = "degraded"
+                full_note += f" — writes are being rejected: {stats.get('last_error')}"
+            influx_component = {"status": influx_status, "note": full_note}
 
         overall = "ok"
-        if ingest_probe["status"] != "ok" or topo_status != "ok":
+        if (ingest_probe["status"] != "ok" or topo_status != "ok"
+                or influx_component["status"] == "degraded"):
             overall = "degraded"
 
         return {
@@ -464,8 +490,8 @@ def create_app(
                 "reason_text": change.get("reason_text"),
                 "pass_number": change.get("pass_number"),
                 "locked_neighborhood": change.get("locked_neighborhood", []),
-                "predicted_ho_failures_avoided_per_week":
-                    change.get("predicted_ho_failures_avoided_per_week"),
+                "predicted_ho_failures_avoided_per_period":
+                    change.get("predicted_ho_failures_avoided_per_period"),
                 "evaluation_matrix": evaluation_matrix,
                 "generated_at": run.get("generated_at"),
                 "status": change.get("status", "pending"),
@@ -495,7 +521,7 @@ def create_app(
         for r in runs:
             rid = r.get("run_id")
             for c in r.get("changes", []):
-                pred = c.get("predicted_ho_failures_avoided_per_week", 0.0) or 0.0
+                pred = c.get("predicted_ho_failures_avoided_per_period", 0.0) or 0.0
                 total_predicted += pred
                 rows.append({
                     "run_id": rid,
@@ -505,19 +531,19 @@ def create_app(
                     "pci_old": c.get("pci_old"),
                     "pci_new": c.get("pci_new"),
                     "reason_code": c.get("reason_code"),
-                    "predicted_ho_failures_avoided_per_week": pred,
+                    "predicted_ho_failures_avoided_per_period": pred,
                     "status": c.get("status", "pending"),
                     "applied_at": r.get("applied_at"),
                     "generated_at": r.get("generated_at"),
                 })
 
-        rows.sort(key=lambda x: -(x["predicted_ho_failures_avoided_per_week"] or 0.0))
+        rows.sort(key=lambda x: -(x["predicted_ho_failures_avoided_per_period"] or 0.0))
 
         predicted_by_tech = {"lte": 0.0, "nr": 0.0}
         for row in rows:
             t = (row.get("technology") or "").lower()
             if t in predicted_by_tech:
-                predicted_by_tech[t] += float(row.get("predicted_ho_failures_avoided_per_week") or 0.0)
+                predicted_by_tech[t] += float(row.get("predicted_ho_failures_avoided_per_period") or 0.0)
 
         observed_failures = {"lte": 0, "nr": 0}
         observed_attempts = {"lte": 0, "nr": 0}
@@ -567,7 +593,7 @@ def create_app(
             "data": {
                 "items": rows,
                 "total": len(rows),
-                "total_predicted_ho_failures_avoided_per_week": round(total_predicted, 1),
+                "total_predicted_ho_failures_avoided_per_period": round(total_predicted, 1),
                 "by_technology": per_tech_summary,
                 "total_observed_failures_in_pm_window": total_observed_failures,
                 "total_pct_failures_eliminated": total_pct_eliminated,
@@ -692,7 +718,7 @@ def create_app(
                 "error": app.state.config_error,
             }
         return {
-            "data": app.state.config.model_dump(),
+            "data": _blank_secrets(app.state.config).model_dump(),
             "stale": False,
             "fetched_at": time.time(),
             "error": None,
@@ -706,11 +732,13 @@ def create_app(
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"validation failed: {e}") from e
 
+        new_cfg = _carry_secrets(new_cfg, app.state.config)
+
         import yaml
         tmp = config_path.with_suffix(".tmp.yaml")
         try:
             with tmp.open("w", encoding="utf-8") as f:
-                yaml.safe_dump(new_cfg.model_dump(), f, sort_keys=False)
+                yaml.safe_dump(_blank_secrets(new_cfg).model_dump(), f, sort_keys=False)
             os.replace(tmp, config_path)
         except OSError as e:
             raise HTTPException(status_code=500, detail=f"write failed: {e}") from e
@@ -736,7 +764,7 @@ def create_app(
         app.state.network_cache.influx_writer = app.state.influx_writer
         return {
             "ok": True,
-            "data": new_cfg.model_dump(),
+            "data": _blank_secrets(new_cfg).model_dump(),
             "fetched_at": time.time(),
         }
 

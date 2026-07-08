@@ -71,6 +71,7 @@ def candidate_sort_key(
     weight_provider: WeightProvider,
     *,
     neighbors: list[Cell] | None = None,
+    pci_usage: dict[int, int] | None = None,
 ) -> tuple[float, ...]:
     if neighbors is None:
         neighbors = network.neighbors_of(cell.id, same_tech_only=True)
@@ -81,18 +82,23 @@ def candidate_sort_key(
         and cell.primary_frequency() is not None
     ]
 
+    collision_term = COLLISION_PENALTY * sum(
+        weight_provider.weight(cell, u)
+        for u in same_freq_neighbors
+        if u.pci == candidate_pci
+    )
+
     mods = _resolved_mod_priority(scoring_cfg, cell.technology)
     mod_terms = tuple(
         _mod_penalty(candidate_pci, same_freq_neighbors, cell, n, weight_provider)
         for n in mods
     )
 
-    if same_freq_neighbors:
-        max_distance = max(abs(candidate_pci - u.pci) for u in same_freq_neighbors)
-    else:
-        max_distance = 0
+    reuse_term = pci_usage.get(candidate_pci, 0) if pci_usage else 0
+    if pci_usage and candidate_pci == cell.pci:
+        reuse_term -= 1
 
-    return (*mod_terms, -max_distance, candidate_pci)
+    return (collision_term, *mod_terms, reuse_term, candidate_pci)
 
 
 def compute_total_soft_cost(
