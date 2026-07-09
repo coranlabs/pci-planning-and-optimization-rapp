@@ -294,7 +294,6 @@ def build_real_pci_data(
     network: Any,
     conflicts_result: dict[str, Any] | None,
     *,
-    synthesize_coords: Any,
     alert_first_seen: dict[str, str] | None = None,
     tech: str | None = None,
     prb_warning: float = 80.0,
@@ -310,11 +309,8 @@ def build_real_pci_data(
         if _tech_of(cell) != tech:
             continue
         prb = round((cell.prb_util or 0.0) * 100, 0)
-        real_pos = cell.lat is not None and cell.lon is not None
-        if real_pos:
-            lat, lng = cell.lat, cell.lon
-        else:
-            lat, lng = synthesize_coords(cell.id)
+        lat, lng = cell.lat, cell.lon
+        real_pos = lat is not None and lng is not None
         neighbor_pcis: list[int] = []
         for n in network.neighbors_of(cell.id, same_tech_only=True):
             if n.pci not in neighbor_pcis:
@@ -549,7 +545,6 @@ class DashboardData:
         prb_warning = min(100.0, max(1.0, prb_warning))
         data = build_real_pci_data(
             network, conflicts_result,
-            synthesize_coords=self._services.synthesize_coords,
             alert_first_seen=self._alert_first_seen,
             tech=tech, prb_warning=prb_warning,
         )

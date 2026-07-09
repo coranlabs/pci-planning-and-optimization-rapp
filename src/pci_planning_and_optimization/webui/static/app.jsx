@@ -493,7 +493,9 @@ function BigTopo({ onSelectCell, selectedCell, colorMode = 'status', showOverlay
 
 
   const coverageGeoJSON = React.useMemo(() => {
-    const features = cells.map(c => {
+    const features = cells
+      .filter(c => typeof c.lat === 'number' && typeof c.lng === 'number')
+      .map(c => {
 
       const N = 36, R_m = 220;
       const lat = c.lat, lng = c.lng;
@@ -549,7 +551,7 @@ function BigTopo({ onSelectCell, selectedCell, colorMode = 'status', showOverlay
     themeRef.current = isDark ? 'dark' : 'light';
 
 
-    let center = [77.2090, 28.6139];
+    let center = [0, 0];
     const valid = cells.filter(c => typeof c.lat === 'number' && typeof c.lng === 'number');
     if (valid.length) {
       const avgLat = valid.reduce((a, c) => a + c.lat, 0) / valid.length;
@@ -1249,8 +1251,8 @@ function BigTopo({ onSelectCell, selectedCell, colorMode = 'status', showOverlay
         </>}
         {approxCount > 0 && (
           <div className="map-legend-note" style={{ marginTop: 2 }}>
-            {approxCount} of {cells.length} cells have no TOPO geodata — drawn at an
-            approximate site position (dashed base). Distances are not survey data.
+            {approxCount} of {cells.length} cells have no TOPO geodata and are not
+              shown on the map.
           </div>
         )}
         {colorMode === 'heat' && <>

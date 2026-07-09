@@ -43,7 +43,6 @@ from pci_planning_and_optimization.api.services import (
     list_run_files,
     load_run,
     probe_osc,
-    synthesize_coords,
 )
 from pci_planning_and_optimization.api.state import NetworkCache
 from pci_planning_and_optimization.app_config import load_config, unfilled
@@ -773,15 +772,13 @@ def create_app(
         cache: NetworkCache | None = app.state.network_cache
         if cache is None:
             return {"data": {"cells": [], "total": 0,
-                              "has_coordinates": False, "synthesized": True,
-                              "center": {"lat": 53.3500, "lon": -6.4200}},
+                              "has_coordinates": False},
                     "stale": True, "fetched_at": 0.0,
                     "error": app.state.config_error or "config not loaded",
                     "data_unavailable": True}
         snap = await asyncio.to_thread(cache.get)
         cells_out: list[dict] = []
         any_real_coords = False
-        any_synthesized = False
 
         if snap.network is not None:
             sev_by_cell: dict[str, str] = {}
@@ -799,14 +796,9 @@ def create_app(
                 _log.warning("conflict severity index build failed: %s", e)
 
             for c in list(snap.network.cells.values())[:max(1, min(limit, 50_000))]:
-                if c.lat is not None and c.lon is not None:
-                    lat, lon = c.lat, c.lon
-                    synthesized = False
+                lat, lon = c.lat, c.lon
+                if lat is not None and lon is not None:
                     any_real_coords = True
-                else:
-                    lat, lon = synthesize_coords(c.id)
-                    synthesized = True
-                    any_synthesized = True
                 row = {
                     "id": c.id,
                     "technology": c.technology.value,
@@ -815,7 +807,6 @@ def create_app(
                     "cell_type": c.cell_type,
                     "lat": lat,
                     "lon": lon,
-                    "coords_synthesized": synthesized,
                     "frequency": c.primary_frequency(),
                     "ho_attempts_total": c.ho_attempts_total,
                     "ho_successes_total": c.ho_successes_total,
@@ -829,8 +820,6 @@ def create_app(
                 "total": len(snap.network.cells) if snap.network else 0,
                 "has_coordinates": True,
                 "any_real_coordinates": any_real_coords,
-                "any_synthesized": any_synthesized,
-                "center": {"lat": 53.3500, "lon": -6.4200},
             },
             "stale": cache.is_stale(snap),
             "fetched_at": snap.wallclock_at,

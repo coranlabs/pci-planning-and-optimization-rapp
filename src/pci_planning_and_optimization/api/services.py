@@ -14,10 +14,8 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
-import math
 from pathlib import Path
 from typing import Any
 
@@ -30,32 +28,6 @@ from pci_planning_and_optimization.app_config import AppConfig
 from pci_planning_and_optimization.models import Network, Technology
 
 _log = logging.getLogger("pci_planning_and_optimization.api.services")
-
-
-_CENTER_LAT = 53.3500
-_CENTER_LON = -6.4200
-_CLUSTER_RADIUS_KM = 11.0
-_KM_PER_DEG_LAT = 110.574
-_SECTOR_OFFSET_KM = 0.03
-
-
-def synthesize_coords(cell_id: str) -> tuple[float, float]:
-    site, _, sector = cell_id.rpartition("-")
-    if not site:
-        site, sector = cell_id, ""
-    h = hashlib.md5(site.encode("utf-8"), usedforsecurity=False).digest()
-    r_norm = int.from_bytes(h[:4], "big") / 0xFFFFFFFF
-    theta = int.from_bytes(h[4:8], "big") / 0xFFFFFFFF * 2 * math.pi
-    radius_km = math.sqrt(r_norm) * _CLUSTER_RADIUS_KM
-    km_per_deg_lon = 111.320 * math.cos(math.radians(_CENTER_LAT))
-    dlat = radius_km * math.cos(theta) / _KM_PER_DEG_LAT
-    dlon = radius_km * math.sin(theta) / km_per_deg_lon
-
-    idx = int(sector) if sector.isdigit() else (h[8] % 3 if sector else 0)
-    bearing = math.radians(idx * 120.0)
-    dlat += (_SECTOR_OFFSET_KM * math.cos(bearing)) / _KM_PER_DEG_LAT
-    dlon += (_SECTOR_OFFSET_KM * math.sin(bearing)) / km_per_deg_lon
-    return _CENTER_LAT + dlat, _CENTER_LON + dlon
 
 
 def compute_kpis(network: Network | None) -> dict[str, Any]:
