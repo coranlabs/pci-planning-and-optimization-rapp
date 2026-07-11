@@ -23,6 +23,8 @@ two neighbours of one cell sharing one, do not raise an alarm; they show up as
 handover failures somewhere else, and nothing in the fault feed points back at
 the identity that caused them.
 
+![PCI Planning and Optimization rApp architecture](docs/images/architecture_diagram.png)
+
 ## How it works
 
 ```
