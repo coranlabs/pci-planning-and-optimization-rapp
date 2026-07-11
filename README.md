@@ -16,9 +16,7 @@ limitations under the License.
 
 # PCI Planning and Optimization rApp
 
-A Non-RT RIC rApp that finds the Physical Cell Identity conflicts a live network
-is carrying, proposes the smallest set of PCI changes that clears them, and
-writes the approved ones back to the RAN over O1. Both LTE and 5G NR.
+The open-source edition of the coRAN Labs PCI Planning and Optimization rApp. A Non-RT RIC rApp that finds the Physical Cell Identity conflicts a live network is carrying, proposes the smallest set of PCI changes that clears them, and writes the approved ones back to the RAN over O1. Both LTE and 5G NR.
 
 A PCI conflict is quiet. Two cells sharing a PCI within each other's reach, or
 two neighbours of one cell sharing one, do not raise an alarm; they show up as
