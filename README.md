@@ -27,16 +27,7 @@ the identity that caused them.
 
 ## How it works
 
-```
-RAN ──VES notifyFileReady──▶ Kafka ──▶ rApp ──SFTP──▶ RAN / O1 adapter
-                                        │  parse TS 32.435 XML
-                                        ▼
-                                   conflict graph
-                                        │  correlation gate
-                                        │  conservative graph coloring
-                                        ▼
-                              dashboard ──operator approval──▶ SDNR ──NETCONF──▶ RAN
-```
+![End-to-end pipeline for intelligent PCI optimization](docs/images/pci_planning_steps_high_level.png)
 
 The RAN closes a reporting period and publishes a `notifyFileReady` event naming
 the PM file it just wrote. The rApp consumes that event, fetches the file over
